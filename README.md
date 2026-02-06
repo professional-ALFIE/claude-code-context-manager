@@ -11,6 +11,14 @@ Strips bulky data from `.jsonl` transcript files:
 
 Preserves: conversation text, edit intent, filenames, uuid chain.
 
+### Manual marking
+
+Wrap any part of your prompt with `<clean>...</clean>` tags to mark it for deletion on the next clean. Useful for pasting large text that you don't need in future context.
+
+```
+<clean>paste your large content here</clean>
+```
+
 ## Installation
 
 ### 1. Skill (for Claude Code)
