@@ -32,11 +32,11 @@ Step 1 - Copy the skill folder:
 cp -a .claude/skills/context-cleaner ~/.claude/skills/
 
 Step 2 - Copy the hook script and make it executable:
-cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+Step 2 - Make the hook script executable:
+chmod +x ~/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh
 
 Step 3 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
 
 After all steps, tell me to restart the session.
 ```
@@ -53,17 +53,16 @@ cp -a .claude/skills/context-cleaner ~/.claude/skills/
 
 This hook is **required** — it provides the transcript path to Claude and copies the resume command to your clipboard. Without it, Claude cannot locate the transcript file.
 
-Copy the hook script:
+The hook script is already included in the skill folder at `src/contextCleaner_sessionStartHook.sh`. Make it executable:
 
 ```bash
-cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+chmod +x ~/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh
 ```
 
 Then register it in `~/.claude/settings.json`. Add the `SessionStart` entry to the `hooks` object (don't remove existing hooks):
 
 ```json
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
 ```
 
 After registration, restart your Claude Code session.

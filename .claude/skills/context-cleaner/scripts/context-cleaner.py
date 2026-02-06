@@ -24,7 +24,7 @@ Context Cleaner v2 - Claude Code 세션 파일 최적화 도구
 | tool_result | message.content[0].content |
 | hook_progress | 줄 전체 삭제 (parentUuid 연결 유지) |
 | bash-stdout/stderr | <bash-stdout>...</bash-stdout><bash-stderr>...</bash-stderr> 패턴 |
-| user-marked | <<clean-예정>>...<//clean-예정>> 패턴 |
+| user-marked | <clean>...</clean> 패턴 |
 | isMeta | Skill 결과 등 isMeta 메시지의 content[0].text |
 | local-cmd-output | bash-input 메시지의 자식 메시지 (로컬 커맨드 출력) |
 
@@ -95,7 +95,7 @@ BASH_TAGS_PATTERN = re.compile(
     r"<bash-stdout>.*?</bash-stdout>\s*<bash-stderr>.*?</bash-stderr>",
     re.DOTALL,
 )
-USER_MARKED_PATTERN = re.compile(r"<<clean-예정>>.*?<</clean-예정>>", re.DOTALL)
+USER_MARKED_PATTERN = re.compile(r"<clean>.*?</clean>", re.DOTALL)
 
 
 # ============================================================================
@@ -821,7 +821,7 @@ def clean_bash_tags(obj, stats):
 
 def clean_user_marked(obj, stats):
     """
-    message.content에서 <<clean-예정>>...<//clean-예정>> 패턴 삭제
+    message.content에서 <clean>...</clean> 패턴 삭제
     - 사용자가 직접 마킹한 삭제 예정 내용
     - message.content가 string 또는 array[{type, text}] 형태 모두 처리
     """
@@ -996,7 +996,7 @@ def clean_transcript(source_path):
                 clean_bash_tags(
                     obj, stats
                 )  # <bash-stdout>...</bash-stdout><bash-stderr>...</bash-stderr>
-                clean_user_marked(obj, stats)  # <<clean-예정>>...<//clean-예정>>
+                clean_user_marked(obj, stats)  # <clean>...</clean>
                 clean_meta_content(obj, stats)  # isMeta (Skill 결과 등)
                 processed_objs.append(obj)
             except json.JSONDecodeError:

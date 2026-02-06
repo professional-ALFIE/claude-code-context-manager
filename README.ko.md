@@ -32,11 +32,11 @@ Step 1 - Copy the skill folder:
 cp -a .claude/skills/context-cleaner ~/.claude/skills/
 
 Step 2 - Copy the hook script and make it executable:
-cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+Step 2 - Make the hook script executable:
+chmod +x ~/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh
 
 Step 3 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
 
 After all steps, tell me to restart the session.
 ```
@@ -53,17 +53,16 @@ cp -a .claude/skills/context-cleaner ~/.claude/skills/
 
 이 훅은 **필수**입니다. Claude에게 트랜스크립트 경로를 제공하고, resume 명령을 클립보드에 복사합니다. 없으면 Claude가 트랜스크립트 파일을 찾을 수 없습니다.
 
-훅 스크립트를 복사합니다:
+훅 스크립트는 스킬 폴더 안에 `src/contextCleaner_sessionStartHook.sh`로 포함되어 있습니다. 실행 권한을 부여합니다:
 
 ```bash
-cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
-chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+chmod +x ~/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh
 ```
 
 `~/.claude/settings.json`에 등록합니다. `hooks` 객체에 `SessionStart` 항목을 추가하세요 (기존 훅은 지우지 마세요):
 
 ```json
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
 ```
 
 등록 후 Claude Code 세션을 재시작하면 적용됩니다.
