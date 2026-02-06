@@ -32,17 +32,26 @@ cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
 chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
 ```
 
-Then register it. Paste the following to your LLM and let it handle the rest:
+Then register it in `~/.claude/settings.json`. Add the `SessionStart` entry to the `hooks` object:
 
----
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
 
-**Paste this to Claude Code:**
-
-> Add a SessionStart hook to my `~/.claude/settings.json`.
-> The command should be: `${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh`
-> Don't remove any existing hooks, just add this one.
-
----
+If you already have other hooks in `settings.json`, just add the `SessionStart` array alongside them. Don't replace existing hooks.
 
 After registration, restart your Claude Code session.
 
