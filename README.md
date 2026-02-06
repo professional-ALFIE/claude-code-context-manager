@@ -21,47 +21,31 @@ Wrap any part of your prompt with `<clean>...</clean>` tags to mark it for delet
 
 ## Installation
 
-### 1. Skill (for Claude Code)
+### 0. Paste this to Claude Code
 
-Copy the skill folder to your Claude skills directory:
+Copy the block below and paste it into Claude Code. It will handle steps 1 and 2 automatically.
 
-```bash
-cp -a .claude/skills/context-cleaner ~/.claude/skills/
 ```
+Install the context-cleaner skill and SessionStart hook from this repo: https://github.com/professional-ALFIE/claude-code-context-manager
 
-### 2. SessionStart Hook (recommended)
+Step 1 - Copy the skill folder:
+cp -a .claude/skills/context-cleaner ~/.claude/skills/
 
-This hook provides the transcript path to Claude automatically and copies the resume command to your clipboard.
-
-Copy the hook script:
-
-```bash
+Step 2 - Copy the hook script and make it executable:
 cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
 chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+
+Step 3 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+
+After all steps, tell me to restart the session.
 ```
 
-Then register it in `~/.claude/settings.json`. Add the `SessionStart` entry to the `hooks` object:
+### Manual installation
 
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+If you prefer to install manually, follow steps 1-3 above by hand.
 
-If you already have other hooks in `settings.json`, just add the `SessionStart` array alongside them. Don't replace existing hooks.
-
-After registration, restart your Claude Code session.
+The SessionStart hook is **required** — it provides the transcript path to Claude and copies the resume command to your clipboard. Without it, Claude cannot locate the transcript file.
 
 ## Usage
 

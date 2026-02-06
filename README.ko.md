@@ -21,47 +21,31 @@ Claude Code 세션 트랜스크립트 클리너. 대화 흐름을 보존하면�
 
 ## 설치
 
-### 1. Skill (Claude Code용)
+### 0. 아래를 복사해서 Claude Code에 붙여넣으세요
 
-스킬 폴더를 Claude 스킬 디렉토리에 복사합니다:
+아래 블록을 통째로 복사해서 Claude Code에 붙여넣으면 1~3단계를 자동으로 처리합니다.
 
-```bash
-cp -a .claude/skills/context-cleaner ~/.claude/skills/
 ```
+Install the context-cleaner skill and SessionStart hook from this repo: https://github.com/professional-ALFIE/claude-code-context-manager
 
-### 2. SessionStart Hook (권장)
+Step 1 - Copy the skill folder:
+cp -a .claude/skills/context-cleaner ~/.claude/skills/
 
-이 훅은 트랜스크립트 경로를 Claude에게 자동 제공하고, resume 명령을 클립보드에 복사합니다.
-
-훅 스크립트를 복사합니다:
-
-```bash
+Step 2 - Copy the hook script and make it executable:
 cp src/contextCleaner_sessionStartHook.sh ~/.claude/hooks/
 chmod +x ~/.claude/hooks/contextCleaner_sessionStartHook.sh
+
+Step 3 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"}]}]}
+
+After all steps, tell me to restart the session.
 ```
 
-`~/.claude/settings.json`에 등록합니다. `hooks` 객체에 `SessionStart` 항목을 추가하세요:
+### 수동 설치
 
-```json
-{
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${HOME}/.claude/hooks/contextCleaner_sessionStartHook.sh"
-          }
-        ]
-      }
-    ]
-  }
-}
-```
+직접 설치하려면 위 1~3단계를 수동으로 진행하세요.
 
-이미 `settings.json`에 다른 훅이 있다면, 기존 훅을 지우지 말고 `SessionStart` 배열만 추가하세요.
-
-등록 후 Claude Code 세션을 재시작하면 적용됩니다.
+SessionStart 훅은 **필수**입니다. 이 훅이 Claude에게 트랜스크립트 경로를 제공하고, resume 명령을 클립보드에 복사합니다. 없으면 Claude가 트랜스크립트 파일을 찾을 수 없습니다.
 
 ## 사용법
 
