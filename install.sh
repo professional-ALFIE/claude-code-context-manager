@@ -3,7 +3,7 @@ set -e
 
 SKILL_DIR="$HOME/.claude/skills/context-cleaner"
 REPO="professional-ALFIE/context-cleaner-skill"
-BRANCH="master"
+BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/$REPO/$BRANCH/.claude/skills/context-cleaner"
 
 echo "Installing context-cleaner skill..."

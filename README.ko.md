@@ -24,7 +24,7 @@ Claude Code 세션 트랜스크립트 클리너. 대화 흐름을 보존하면�
 ### 원라이너 설치 (추천)
 
 ```bash
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/master/install.sh | bash
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
 ```
 
 `~/.claude/skills/context-cleaner/`에 스킬과 스크립트가 설치됩니다.
@@ -49,7 +49,7 @@ curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-sk
 Install the context-cleaner skill from this repo: https://github.com/professional-ALFIE/context-cleaner-skill
 
 Step 1 - Run the install script:
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/master/install.sh | bash
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
 
 Step 2 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
 {"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}

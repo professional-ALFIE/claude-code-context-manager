@@ -24,7 +24,7 @@ Wrap any part of your prompt with `<clean>...</clean>` tags to mark it for delet
 ### Quick Install (Recommended)
 
 ```bash
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/master/install.sh | bash
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
 ```
 
 This installs the skill and scripts to `~/.claude/skills/context-cleaner/`.
@@ -49,7 +49,7 @@ Copy the block below and paste it into Claude Code. It will handle everything au
 Install the context-cleaner skill from this repo: https://github.com/professional-ALFIE/context-cleaner-skill
 
 Step 1 - Run the install script:
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/master/install.sh | bash
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
 
 Step 2 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
 {"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
