@@ -32,21 +32,86 @@ Claude Code 세션 트랜스크립트 클리너. 대화 흐름을 보존하면�
 
 ### 삭제 대상
 
-| 소스 | 삭제 필드 |
-|------|-----------|
-| Thinking | `message.content[0].thinking` |
-| Read | `toolUseResult.file.content`, 전체 경로 → 파일명 |
-| Write | `input.content`, `toolUseResult.content/originalFile`, 전체 경로 → 파일명 |
-| Edit | `input.old_string/new_string`, `toolUseResult.oldString/newString/originalFile` |
-| Bash | `input.command`, `toolUseResult.stdout/stderr` |
-| Grep/Glob | `toolUseResult.filenames` → `[""]` |
-| ExitPlanMode | `input.plan` |
-| Task | `toolUseResult.task.output` |
-| tool_result | `message.content[0].content` (toolUseResult과 중복) |
-| isMeta | `content[0].text` (주입된 SKILL.md 등) |
-| hook_progress | 줄 전체 삭제 (uuid 체인 유지) |
-| bash tags | `<bash-stdout>...<bash-stderr>` 패턴 |
-| user-marked | `<clean>...</clean>` 패턴 |
+Claude Code는 모든 동작을 JSONL 트랜스크립트에 기록합니다. 클리너는 대화 구조를 보존하면서 무거운 필드를 가벼운 마커로 치환합니다.
+
+#### Thinking
+
+어시스턴트 응답마다 Extended Thinking 내용이 포함됩니다.
+
+- `message.content[N].thinking` → 치환
+
+#### Read
+
+파일을 읽으면 파일 전체 내용이 트랜스크립트에 기록됩니다.
+
+- **호출**: `input.file_path` → 파일명만 남김
+- **실행 결과**: `toolUseResult.file.content` → 치환
+- **결과 중복**: `tool_result.content` → 치환
+
+#### Write
+
+파일을 작성하면 작성 내용과 원본 파일이 기록됩니다.
+
+- **호출**: `input.file_path` → 파일명만 남김, `input.content` → 치환
+- **실행 결과**: `toolUseResult.content`, `.originalFile`, `.structuredPatch` → 치환
+- **결과 중복**: `tool_result.content` → 치환
+
+#### Edit
+
+파일을 편집하면 변경 전/후 문자열과 원본 파일이 기록됩니다.
+
+- **호출**: `input.file_path` → 파일명만 남김, `input.old_string`, `input.new_string` → 치환
+- **실행 결과**: `toolUseResult.oldString`, `.newString`, `.originalFile`, `.structuredPatch` → 치환
+- **결과 중복**: `tool_result.content` → 치환
+
+#### Bash
+
+명령을 실행하면 명령어와 전체 출력이 기록됩니다.
+
+- **호출**: `input.command` → 치환
+- **실행 결과**: `toolUseResult.stdout`, `.stderr` → 치환
+- **진행 로그**: `data.output`, `data.fullOutput` (bash_progress 행) → 치환
+- **결과 중복**: `tool_result.content` → 치환
+
+#### Grep / Glob
+
+검색하면 매칭된 파일 경로 목록이 기록됩니다.
+
+- **실행 결과**: `toolUseResult.filenames` → `[""]`로 치환
+
+#### Task (서브에이전트)
+
+서브에이전트를 호출하면 프롬프트와 에이전트의 전체 응답이 기록됩니다. 프롬프트는 세 곳에 저장됩니다 (Path A/B/C).
+
+- **호출 (Path A)**: `input.prompt` → 치환
+- **실행 결과**: `toolUseResult.task.output` 또는 `toolUseResult.content[N].text` → 치환
+- **결과 프롬프트 (Path C)**: `toolUseResult.prompt` → 치환
+- **진행 로그 (Path B)**: `data.message.message.content` (agent_progress 행) → 치환
+- **결과 중복**: `tool_result.content` → 치환
+
+#### WebFetch
+
+URL을 가져오면 페이지 전체 내용이 기록됩니다.
+
+- **실행 결과**: `toolUseResult.result` (string) → 치환
+
+#### ExitPlanMode
+
+플랜 모드를 종료하면 플랜 텍스트가 기록됩니다.
+
+- **호출**: `input.plan` → 치환
+
+#### 기타 대상
+
+특정 도구에 묶이지 않지만, 클리닝 대상인 항목들입니다.
+
+- **이미지 첨부**: `source.data` base64 → 1x1 투명 PNG로 치환, `source.media_type` → `image/png`
+- **hook_progress**: 줄 전체 삭제 (parentUuid 리매핑으로 uuid 체인 유지)
+- **meta 메시지** (isMeta): `content[N].text` → 치환 (주입된 SKILL.md, 시스템 프롬프트 등)
+- **bash 태그**: 사용자 메시지 내 `<bash-stdout>...<bash-stderr>` 패턴 → 치환
+- **사용자 마킹**: `<clean>...</clean>` 패턴 → 치환
+- **teammate-message**: 태그 내부 본문 → 치환 (`summary` 등 여는 태그 속성은 보존)
+- **local-command-stdout**: 태그 내부 → 200자 초과 시 치환 (짧은 출력은 보존)
 
 ### 수동 마킹
 
