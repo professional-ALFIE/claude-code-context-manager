@@ -39,6 +39,8 @@ Claude Code는 resume 시 JSONL의 모든 키가 존재한다고 가정하고 �
 | user-marked | <clean>...</clean> 패턴 |
 | isMeta | Skill 결과 등 isMeta 메시지의 content[0].text |
 | local-cmd-output | bash-input 메시지의 자식 메시지 (로컬 커맨드 출력) |
+| toolUseResult.prompt | toolUseResult.prompt (agent_prompt) |
+| local-command-stdout | <local-command-stdout>...</local-command-stdout> 내부 콘텐츠 |
 
 [파일명 규칙]
 - 마지막 12자리를 '00effaced{NNN}'으로 교체
@@ -99,7 +101,9 @@ CLEANED_USER_MARKED = "[context-cleaner: user-marked]"
 CLEANED_TASK_OUTPUT = "[context-cleaner: taskoutput]"
 CLEANED_BASH_PROGRESS = "[context-cleaner: bashoutput]"
 CLEANED_AGENT_PROMPT = "[context-cleaner: agent_prompt]"
-CLEANED_BASE64_IMAGE = "[context-cleaner: base64_image]"
+CLEANED_BASE64_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII="
+CLEANED_TOOL_RESULT_STRING = "[context-cleaner: tool_result_string]"
+CLEANED_TEAMMATE_MESSAGE = "[context-cleaner: teammate_message]"
 
 # 정규식 패턴
 # 로컬 명령 출력: <local-command-caveat>...<bash-input>CMD</bash-input><bash-stdout>OUT</bash-stdout><bash-stderr>ERR</bash-stderr>
@@ -110,6 +114,8 @@ BASH_TAGS_PATTERN = re.compile(
     re.DOTALL,
 )
 USER_MARKED_PATTERN = re.compile(r"<clean>.*?</clean>", re.DOTALL)
+TEAMMATE_MESSAGE_PATTERN = re.compile(r'(<teammate-message[^>]*>).*?(</teammate-message>)', re.DOTALL)
+LOCAL_COMMAND_STDOUT_PATTERN = re.compile(r'(<local-command-stdout>).*?(</local-command-stdout>)', re.DOTALL)
 
 
 # ============================================================================
@@ -159,6 +165,16 @@ class CleaningStats:
         self.task_content_text_bytes = 0
         self.base64_image_count = 0
         self.base64_image_bytes = 0
+        self.tool_result_string_count = 0
+        self.tool_result_string_bytes = 0
+        self.teammate_message_count = 0
+        self.teammate_message_bytes = 0
+        self.tool_use_result_prompt_count = 0
+        self.tool_use_result_prompt_bytes = 0
+        self.local_command_stdout_count = 0
+        self.local_command_stdout_bytes = 0
+        self.tool_use_input_prompt_count = 0
+        self.tool_use_input_prompt_bytes = 0
 
     def total_bytes(self):
         return (
@@ -182,6 +198,11 @@ class CleaningStats:
             + self.agent_progress_bytes
             + self.task_content_text_bytes
             + self.base64_image_bytes
+            + self.tool_result_string_bytes
+            + self.teammate_message_bytes
+            + self.tool_use_result_prompt_bytes
+            + self.local_command_stdout_bytes
+            + self.tool_use_input_prompt_bytes
         )
 
     def print_stats(self, source_path, output_path, original_size, new_size, new_session_id=None):
@@ -248,6 +269,21 @@ class CleaningStats:
         )
         print(
             f"  Base64 images:       {self.base64_image_count:>4} cleaned ({self.base64_image_bytes:,} bytes)"
+        )
+        print(
+            f"  Tool result string:  {self.tool_result_string_count:>4} cleaned ({self.tool_result_string_bytes:,} bytes)"
+        )
+        print(
+            f"  Teammate message:    {self.teammate_message_count:>4} cleaned ({self.teammate_message_bytes:,} bytes)"
+        )
+        print(
+            f"  ToolResult prompt:   {self.tool_use_result_prompt_count:>4} cleaned ({self.tool_use_result_prompt_bytes:,} bytes)"
+        )
+        print(
+            f"  Local cmd stdout:    {self.local_command_stdout_count:>4} cleaned ({self.local_command_stdout_bytes:,} bytes)"
+        )
+        print(
+            f"  ToolUse inp prompt: {self.tool_use_input_prompt_count:>4} cleaned ({self.tool_use_input_prompt_bytes:,} bytes)"
         )
         print(f"  Hook progress:       {self.hook_progress_count:>4} lines removed")
         print(f"  SessionId updated:   {self.sessionid_count:>4} entries")
@@ -916,6 +952,13 @@ def clean_agent_progress(obj, stats):
                                 stats.agent_progress_bytes += len(cmd_val.encode("utf-8"))
                                 inp["command"] = CLEANED_BASH_INPUT
                                 cleaned = True
+                        # 2c. text 필드 처리 (agent_prompt 중복 텍스트)
+                        if item.get("type") == "text" and "text" in item:
+                            text_val = item["text"]
+                            if isinstance(text_val, str) and len(text_val) > 100 and "[context-cleaner:" not in text_val:
+                                stats.agent_progress_bytes += len(text_val.encode("utf-8"))
+                                item["text"] = CLEANED_AGENT_PROMPT
+                                cleaned = True
 
         if cleaned:
             stats.agent_progress_count += 1
@@ -1108,10 +1151,172 @@ def clean_base64_images(obj, stats):
                         source["data"] = CLEANED_BASE64_IMAGE
                         stats.base64_image_count += 1
                         cleaned = True
+                    # media_type은 data 치환과 독립적으로 항상 확인
+                    if source.get("media_type") != "image/png":
+                        source["media_type"] = "image/png"
+                        cleaned = True
         return cleaned
     except Exception:
         pass
     return False
+
+
+def clean_tool_use_result_string(obj, stats):
+    """
+    toolUseResult.result (string) 정리
+    - WebFetch 등의 도구가 반환하는 result 문자열 (수천 자)
+    - bytes, code, codeText, durationMs, url 등 메타데이터는 보존
+    """
+    try:
+        result = obj.get("toolUseResult", {})
+        if isinstance(result, dict) and "result" in result:
+            result_val = result["result"]
+            if isinstance(result_val, str) and len(result_val) > 200 and result_val != CLEANED_TOOL_RESULT_STRING:
+                stats.tool_result_string_bytes += len(result_val.encode("utf-8"))
+                stats.tool_result_string_count += 1
+                result["result"] = CLEANED_TOOL_RESULT_STRING
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def clean_teammate_message(obj, stats):
+    """
+    teammate-message 태그 내부 콘텐츠 정리
+    - type: "user" + teamName이 있는 메시지의 message.content에서
+      <teammate-message ...>본문</teammate-message> 의 본문만 placeholder로 치환
+    - 여는 태그(summary, teammate_id, color 속성 포함)와 닫는 태그는 보존
+    """
+    try:
+        if obj.get("type") != "user" or not obj.get("teamName"):
+            return False
+        message = obj.get("message", {})
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content", "")
+        if not isinstance(content, str) or "<teammate-message" not in content:
+            return False
+
+        cleaned = TEAMMATE_MESSAGE_PATTERN.sub(
+            r'\1[context-cleaner: teammate_message]\2', content
+        )
+        if cleaned != content:
+            stats.teammate_message_bytes += len(content.encode("utf-8")) - len(cleaned.encode("utf-8"))
+            stats.teammate_message_count += 1
+            message["content"] = cleaned
+            return True
+    except Exception:
+        pass
+    return False
+
+def clean_tool_use_result_prompt(obj, stats):
+    """
+    toolUseResult.prompt 정리 (누락 보완)
+    - toolUseResult가 dict이고 prompt 키가 있는 모든 경우를 커버
+    - status: "teammate_spawned", "async_launched" 등에서 누락된 prompt 치환
+    - 이미 clean_task_content_text()가 처리하는 content+prompt 조합은 그 함수에서 처리됨
+    - 이 함수는 content 키가 없지만 prompt가 있는 나머지 케이스를 보완
+    """
+    try:
+        result = obj.get("toolUseResult", {})
+        if not isinstance(result, dict):
+            return False
+        prompt_val = result.get("prompt")
+        if not isinstance(prompt_val, str):
+            return False
+        if len(prompt_val) <= 100:
+            return False
+        if "[context-cleaner:" in prompt_val:
+            return False
+
+        stats.tool_use_result_prompt_bytes += len(prompt_val.encode("utf-8"))
+        stats.tool_use_result_prompt_count += 1
+        result["prompt"] = CLEANED_AGENT_PROMPT
+        return True
+    except Exception:
+        pass
+    return False
+
+
+def clean_tool_use_input_prompt(obj, stats):
+    """
+    tool_use의 input.prompt 정리 (assistant 행)
+    - message.content[N].type == "tool_use" 인 항목의 input.prompt 치환
+    - Task, call_omo_agent 등 서브에이전트 호출 시 대형 프롬프트가 저장됨
+    - input의 다른 키(description, model, subagent_type, name 등)는 모두 보존
+    - 경로A: tool_use input.prompt (이 함수)
+    - 경로B: agent_progress data.prompt (clean_agent_progress)
+    - 경로C: toolUseResult.prompt (clean_tool_use_result_prompt, clean_task_content_text)
+    """
+    try:
+        content = obj.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            return False
+
+        cleaned = False
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "tool_use":
+                continue
+            inp = item.get("input", {})
+            if not isinstance(inp, dict):
+                continue
+            prompt_val = inp.get("prompt")
+            if not isinstance(prompt_val, str):
+                continue
+            if len(prompt_val) <= 100:
+                continue
+            if "[context-cleaner:" in prompt_val:
+                continue
+
+            stats.tool_use_input_prompt_bytes += len(prompt_val.encode("utf-8"))
+            stats.tool_use_input_prompt_count += 1
+            inp["prompt"] = CLEANED_AGENT_PROMPT
+            cleaned = True
+
+        return cleaned
+    except Exception:
+        pass
+    return False
+
+
+def clean_local_command_stdout(obj, stats):
+    """
+    <local-command-stdout> 태그 내부 대형 콘텐츠 정리
+    - type: user + message.content가 string + <local-command-stdout> 포함 + 200자 초과
+    - 여는 태그와 닫는 태그는 보존, 내부 내용만 placeholder로 치환
+    - ANSI 이스케이프 코드를 포함한 Context Usage 출력 등
+    """
+    try:
+        if obj.get("type") != "user":
+            return False
+        message = obj.get("message", {})
+        if not isinstance(message, dict):
+            return False
+        content = message.get("content", "")
+        if not isinstance(content, str):
+            return False
+        if "<local-command-stdout>" not in content:
+            return False
+        if len(content) <= 200:
+            return False
+        if "[context-cleaner:" in content:
+            return False
+
+        cleaned = LOCAL_COMMAND_STDOUT_PATTERN.sub(
+            r'\1[context-cleaner: local_command_stdout]\2', content
+        )
+        if cleaned != content:
+            stats.local_command_stdout_bytes += len(content.encode("utf-8")) - len(cleaned.encode("utf-8"))
+            stats.local_command_stdout_count += 1
+            message["content"] = cleaned
+            return True
+    except Exception:
+        pass
+    return False
+
 
 def update_session_id(obj, new_session_id, stats):
     """
@@ -1171,6 +1376,11 @@ def process_line(obj, new_session_id, stats):
     clean_user_marked(obj, stats)               # <clean>...</clean> 패턴
     clean_meta_content(obj, stats)              # isMeta (Skill 결과 등)
     clean_base64_images(obj, stats)              # base64 이미지 데이터
+    clean_tool_use_result_string(obj, stats)   # toolUseResult.result (string)
+    clean_teammate_message(obj, stats)          # teammate-message 내부 콘텐츠
+    clean_tool_use_result_prompt(obj, stats)  # toolUseResult.prompt (누락 보완)
+    clean_local_command_stdout(obj, stats)    # <local-command-stdout> 태그
+    clean_tool_use_input_prompt(obj, stats)  # tool_use input.prompt (경로A)
 
 
 def clean_transcript(source_path):
