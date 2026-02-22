@@ -173,6 +173,8 @@ class CleaningStats:
         self.tool_use_result_prompt_bytes = 0
         self.local_command_stdout_count = 0
         self.local_command_stdout_bytes = 0
+        self.tool_use_input_prompt_count = 0
+        self.tool_use_input_prompt_bytes = 0
 
     def total_bytes(self):
         return (
@@ -200,6 +202,7 @@ class CleaningStats:
             + self.teammate_message_bytes
             + self.tool_use_result_prompt_bytes
             + self.local_command_stdout_bytes
+            + self.tool_use_input_prompt_bytes
         )
 
     def print_stats(self, source_path, output_path, original_size, new_size, new_session_id=None):
@@ -278,6 +281,9 @@ class CleaningStats:
         )
         print(
             f"  Local cmd stdout:    {self.local_command_stdout_count:>4} cleaned ({self.local_command_stdout_bytes:,} bytes)"
+        )
+        print(
+            f"  ToolUse inp prompt: {self.tool_use_input_prompt_count:>4} cleaned ({self.tool_use_input_prompt_bytes:,} bytes)"
         )
         print(f"  Hook progress:       {self.hook_progress_count:>4} lines removed")
         print(f"  SessionId updated:   {self.sessionid_count:>4} entries")
@@ -1233,6 +1239,49 @@ def clean_tool_use_result_prompt(obj, stats):
     return False
 
 
+def clean_tool_use_input_prompt(obj, stats):
+    """
+    tool_use의 input.prompt 정리 (assistant 행)
+    - message.content[N].type == "tool_use" 인 항목의 input.prompt 치환
+    - Task, call_omo_agent 등 서브에이전트 호출 시 대형 프롬프트가 저장됨
+    - input의 다른 키(description, model, subagent_type, name 등)는 모두 보존
+    - 경로A: tool_use input.prompt (이 함수)
+    - 경로B: agent_progress data.prompt (clean_agent_progress)
+    - 경로C: toolUseResult.prompt (clean_tool_use_result_prompt, clean_task_content_text)
+    """
+    try:
+        content = obj.get("message", {}).get("content", [])
+        if not isinstance(content, list):
+            return False
+
+        cleaned = False
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") != "tool_use":
+                continue
+            inp = item.get("input", {})
+            if not isinstance(inp, dict):
+                continue
+            prompt_val = inp.get("prompt")
+            if not isinstance(prompt_val, str):
+                continue
+            if len(prompt_val) <= 100:
+                continue
+            if "[context-cleaner:" in prompt_val:
+                continue
+
+            stats.tool_use_input_prompt_bytes += len(prompt_val.encode("utf-8"))
+            stats.tool_use_input_prompt_count += 1
+            inp["prompt"] = CLEANED_AGENT_PROMPT
+            cleaned = True
+
+        return cleaned
+    except Exception:
+        pass
+    return False
+
+
 def clean_local_command_stdout(obj, stats):
     """
     <local-command-stdout> 태그 내부 대형 콘텐츠 정리
@@ -1331,6 +1380,7 @@ def process_line(obj, new_session_id, stats):
     clean_teammate_message(obj, stats)          # teammate-message 내부 콘텐츠
     clean_tool_use_result_prompt(obj, stats)  # toolUseResult.prompt (누락 보완)
     clean_local_command_stdout(obj, stats)    # <local-command-stdout> 태그
+    clean_tool_use_input_prompt(obj, stats)  # tool_use input.prompt (경로A)
 
 
 def clean_transcript(source_path):
