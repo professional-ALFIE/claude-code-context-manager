@@ -2,6 +2,46 @@
 
 Claude Code 세션 트랜스크립트 클리너. 대화 흐름을 보존하면서 트랜스크립트 크기를 60-80% 줄여줍니다.
 
+## 설치
+
+### 원라이너 설치 (추천)
+
+```bash
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
+```
+
+`~/.claude/skills/context-cleaner/`에 스킬과 스크립트가 설치됩니다.
+
+### SessionStart Hook (필수)
+
+이 훅은 **필수**입니다. Claude에게 트랜스크립트 경로를 제공하고, resume 명령을 클립보드에 복사합니다. 없으면 Claude가 트랜스크립트 파일을 찾을 수 없습니다.
+
+정리된 세션도 **자동 감지**합니다. 세션 ID에 `00effaced`가 포함되어 있으면 정리된 세션이라는 안내를 표시합니다.
+
+설치 스크립트 실행 후, `~/.claude/settings.json`에 훅을 등록하세요. `hooks` 객체에 `SessionStart` 항목을 추가합니다 (기존 훅은 지우지 마세요):
+
+```json
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
+```
+
+등록 후 Claude Code 세션을 재시작하면 적용됩니다.
+
+### Claude에 붙여넣기 설치 (대안)
+
+아래 블록을 통째로 복사해서 Claude Code에 붙여넣으면 자동으로 처리됩니다.
+
+```
+Install the context-cleaner skill from this repo: https://github.com/professional-ALFIE/context-cleaner-skill
+
+Step 1 - Run the install script:
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
+
+Step 2 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
+
+After all steps, tell me to restart the session.
+```
+
 ## 기능
 
 `.jsonl` 트랜스크립트 파일에서 불필요한 데이터를 제거합니다:
@@ -140,46 +180,6 @@ URL을 가져오면 페이지 전체 내용이 기록됩니다.
 🚀 To resume this cleaned session, run:
    claude --resume 9c4c1a42-...-00effaced001 --verbose
 📋 Copied to clipboard!
-```
-
-## 설치
-
-### 원라이너 설치 (추천)
-
-```bash
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
-```
-
-`~/.claude/skills/context-cleaner/`에 스킬과 스크립트가 설치됩니다.
-
-### SessionStart Hook (필수)
-
-이 훅은 **필수**입니다. Claude에게 트랜스크립트 경로를 제공하고, resume 명령을 클립보드에 복사합니다. 없으면 Claude가 트랜스크립트 파일을 찾을 수 없습니다.
-
-정리된 세션도 **자동 감지**합니다. 세션 ID에 `00effaced`가 포함되어 있으면 정리된 세션이라는 안내를 표시합니다.
-
-설치 스크립트 실행 후, `~/.claude/settings.json`에 훅을 등록하세요. `hooks` 객체에 `SessionStart` 항목을 추가합니다 (기존 훅은 지우지 마세요):
-
-```json
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
-```
-
-등록 후 Claude Code 세션을 재시작하면 적용됩니다.
-
-### Claude에 붙여넣기 설치 (대안)
-
-아래 블록을 통째로 복사해서 Claude Code에 붙여넣으면 자동으로 처리됩니다.
-
-```
-Install the context-cleaner skill from this repo: https://github.com/professional-ALFIE/context-cleaner-skill
-
-Step 1 - Run the install script:
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
-
-Step 2 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
-
-After all steps, tell me to restart the session.
 ```
 
 ## 사용법

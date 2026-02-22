@@ -2,6 +2,46 @@
 
 Claude Code session transcript cleaner. Reduces transcript size by 60-80% while preserving conversation flow.
 
+## Installation
+
+### Quick Install (Recommended)
+
+```bash
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
+```
+
+This installs the skill and scripts to `~/.claude/skills/context-cleaner/`.
+
+### SessionStart Hook (Required)
+
+This hook is **required** — it provides the transcript path to Claude and copies the resume command to your clipboard. Without it, Claude cannot locate the transcript file.
+
+It also **auto-detects** cleaned sessions: when a session ID contains `00effaced`, the hook displays a notice explaining what was preserved and removed.
+
+After running the install script, register the hook in `~/.claude/settings.json`. Add the `SessionStart` entry to the `hooks` object (don't remove existing hooks):
+
+```json
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
+```
+
+After registration, restart your Claude Code session.
+
+### Paste-to-Claude Install (Alternative)
+
+Copy the block below and paste it into Claude Code. It will handle everything automatically.
+
+```
+Install the context-cleaner skill from this repo: https://github.com/professional-ALFIE/context-cleaner-skill
+
+Step 1 - Run the install script:
+curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
+
+Step 2 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
+{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
+
+After all steps, tell me to restart the session.
+```
+
 ## What it does
 
 Strips bulky data from `.jsonl` transcript files:
@@ -140,46 +180,6 @@ After cleaning, you get a detailed report:
 🚀 To resume this cleaned session, run:
    claude --resume 9c4c1a42-...-00effaced001 --verbose
 📋 Copied to clipboard!
-```
-
-## Installation
-
-### Quick Install (Recommended)
-
-```bash
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
-```
-
-This installs the skill and scripts to `~/.claude/skills/context-cleaner/`.
-
-### SessionStart Hook (Required)
-
-This hook is **required** — it provides the transcript path to Claude and copies the resume command to your clipboard. Without it, Claude cannot locate the transcript file.
-
-It also **auto-detects** cleaned sessions: when a session ID contains `00effaced`, the hook displays a notice explaining what was preserved and removed.
-
-After running the install script, register the hook in `~/.claude/settings.json`. Add the `SessionStart` entry to the `hooks` object (don't remove existing hooks):
-
-```json
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
-```
-
-After registration, restart your Claude Code session.
-
-### Paste-to-Claude Install (Alternative)
-
-Copy the block below and paste it into Claude Code. It will handle everything automatically.
-
-```
-Install the context-cleaner skill from this repo: https://github.com/professional-ALFIE/context-cleaner-skill
-
-Step 1 - Run the install script:
-curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-skill/main/install.sh | bash
-
-Step 2 - Add this SessionStart hook entry to ~/.claude/settings.json inside the "hooks" object. Do NOT remove any existing hooks:
-{"SessionStart":[{"hooks":[{"type":"command","command":"${HOME}/.claude/skills/context-cleaner/src/contextCleaner_sessionStartHook.sh"}]}]}
-
-After all steps, tell me to restart the session.
 ```
 
 ## Usage
