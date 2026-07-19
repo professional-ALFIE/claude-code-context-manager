@@ -14,7 +14,7 @@ This installs the skill and scripts to `~/.claude/skills/context-cleaner/`.
 
 ### SessionStart Hook (Required)
 
-This hook is **required** — it provides the transcript path to Claude and copies the resume command to your clipboard. Without it, Claude cannot locate the transcript file.
+This hook is **required** — it provides the transcript path and session ID to Claude and exports them through `CLAUDE_ENV_FILE`. Without it, Claude cannot locate the transcript file.
 
 It also **auto-detects** cleaned sessions: when a session ID contains `00effaced`, the hook displays a notice explaining what was preserved and removed.
 
@@ -54,12 +54,12 @@ Preserves: conversation text, edit intent, filenames, uuid chain.
 ### How it works
 
 1. **Cleans** — Removes heavy data (thinking, file contents, bash output, etc.) and replaces with lightweight markers like `[context-cleaner: Read]`
-2. **Generates new file** — Original file stays untouched. A new file is created with `00effaced` in the filename ("effaced" = erased/removed)
+2. **Writes atomically in place by default** — The cleaned transcript replaces the original only after verification passes. Use `--fork` to preserve the original and create a `00effaced` copy
 3. **Maintains uuid chain** — When lines are deleted, `parentUuid` references are remapped so the conversation tree stays intact. Claude `--resume` works correctly
-4. **Unifies sessionId** — All `sessionId` entries are updated to match the new filename, preventing session detection issues
-5. **Copies resume command** — After cleaning, `claude --resume <new_id> --verbose` is automatically copied to your clipboard (macOS)
+4. **Preserves resume state** — `last-prompt.leafUuid`, `sourceToolAssistantUUID`, snapshots, and parent references are remapped when rows are deleted
+5. **Verifies before replacement** — Orphans, cycles, broken references, conversation roots, and resume anchors are checked before an in-place rename
 
-### File naming
+### File naming with `--fork`
 
 ```
 Original:  9c4c1a42-...-239d2e110282.jsonl
@@ -166,7 +166,7 @@ Wrap any part of your prompt with `<clean>...</clean>` tags to mark it for delet
 After cleaning, you get a detailed report:
 
 ```
-✅ Context Cleaner v2 completed!
+✅ Context Cleaner v5 completed!
 
 📊 Cleaning Statistics:
   Thinking blocks:       42 cleaned (128,400 bytes)
@@ -191,8 +191,12 @@ Just tell Claude: "context clean해줘" or "transcript 정리해줘"
 ### Via CLI
 
 ```bash
-~/.claude/skills/context-cleaner/scripts/context-cleaner.py /path/to/session.jsonl
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl --fork
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts <session-uuid-prefix> --hooks keep
 ```
+
+The default mode is atomic in-place replacement. Use `--fork` when comparing results or when the original transcript must remain untouched. The Python implementation is retained only as the legacy v4 fallback.
 
 ### Resume cleaned session
 
@@ -206,6 +210,6 @@ The `--verbose` flag lets you see the SessionStart hook output (including the cl
 
 ## Requirements
 
-- Python 3
+- Bun
 - `jq` (for the hook script)
-- macOS (pbcopy for clipboard — hook and cleaner script)
+- macOS (optional `pbcopy` support)

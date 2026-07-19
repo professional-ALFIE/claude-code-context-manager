@@ -3,8 +3,8 @@
 Context Cleaner v4 - Claude Code 세션 파일 최적화 도구
 
 목적: "상세 변경내역은 몰라도, 흐름은 기억나도록"
-- thinking block, toolUseResult, 파일 전체경로 삭제
-- 대화 기록, 편집 의도, 파일명은 보존
+- thinking block, toolUseResult, attachment, 파일 전체경로 삭제
+- 대화 기록(사용자 발화 포함), 편집 의도, 파일명, signature는 보존
 - session compact보다 토큰 효율과 맥락 기억이 좋음
 
 원본 파일을 보존하고, 00effaced{NNN} suffix로 새 파일 생성.
@@ -26,7 +26,7 @@ Claude Code는 resume 시 JSONL의 모든 키가 존재한다고 가정하고 �
 
 | 도구/패턴 | 삭제 필드 |
 |-----------|-----------|
-| Thinking | message.content[0].thinking |
+| Thinking | message.content[0].thinking (signature는 보존) |
 | Read | toolUseResult.file.content, filePath→파일명만 |
 | Write | input.content, toolUseResult.content/originalFile, filePath→파일명만 |
 | Edit | input.old_string/new_string, toolUseResult.oldString/newString/originalFile, filePath→파일명만 |
@@ -41,6 +41,8 @@ Claude Code는 resume 시 JSONL의 모든 키가 존재한다고 가정하고 �
 | local-cmd-output | bash-input 메시지의 자식 메시지 (로컬 커맨드 출력) |
 | toolUseResult.prompt | toolUseResult.prompt (agent_prompt) |
 | local-command-stdout | <local-command-stdout>...</local-command-stdout> 내부 콘텐츠 |
+| attachment(skill) | attachment.content (string, 세션 주입 skill 목록) → placeholder |
+| attachment(file) | attachment.content.file.content → placeholder, filePath→파일명 |
 
 [파일명 규칙]
 - 마지막 12자리를 '00effaced{NNN}'으로 교체
@@ -55,8 +57,10 @@ Claude Code는 resume 시 JSONL의 모든 키가 존재한다고 가정하고 �
 
 [보존 항목]
 - uuid, parentUuid, signature, sessionId 등 식별자
+  (signature는 thinking 암호화 서명: 변형 시 resume 400, 토큰도 안 먹어 줄일 이유 없음)
 - structuredPatch는 빈 배열 []로 교체 (삭제하면 에러)
 - 대화 텍스트, 파일명, 편집 의도
+- 사용자 발화(message.content, type=user)는 절대 삭제하지 않고 보존 (대화 흐름의 뼈대)
 
 사용법:
     python3 context-cleaner.py /path/to/session.jsonl
@@ -104,6 +108,7 @@ CLEANED_AGENT_PROMPT = "[context-cleaner: agent_prompt]"
 CLEANED_BASE64_IMAGE = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGNgAAIAAAUAAXpeqz8AAAAASUVORK5CYII="
 CLEANED_TOOL_RESULT_STRING = "[context-cleaner: tool_result_string]"
 CLEANED_TEAMMATE_MESSAGE = "[context-cleaner: teammate_message]"
+CLEANED_ATTACHMENT = "[context-cleaner: attachment]"  # 세션 시작 주입 skill 목록 등 attachment 본문
 
 # 정규식 패턴
 # 로컬 명령 출력: <local-command-caveat>...<bash-input>CMD</bash-input><bash-stdout>OUT</bash-stdout><bash-stderr>ERR</bash-stderr>
@@ -175,6 +180,8 @@ class CleaningStats:
         self.local_command_stdout_bytes = 0
         self.tool_use_input_prompt_count = 0
         self.tool_use_input_prompt_bytes = 0
+        self.attachment_count = 0
+        self.attachment_bytes = 0
 
     def total_bytes(self):
         return (
@@ -203,6 +210,7 @@ class CleaningStats:
             + self.tool_use_result_prompt_bytes
             + self.local_command_stdout_bytes
             + self.tool_use_input_prompt_bytes
+            + self.attachment_bytes
         )
 
     def print_stats(self, source_path, output_path, original_size, new_size, new_session_id=None):
@@ -285,6 +293,9 @@ class CleaningStats:
         print(
             f"  ToolUse inp prompt: {self.tool_use_input_prompt_count:>4} cleaned ({self.tool_use_input_prompt_bytes:,} bytes)"
         )
+        print(
+            f"  Attachments:         {self.attachment_count:>4} cleaned ({self.attachment_bytes:,} bytes)"
+        )
         print(f"  Hook progress:       {self.hook_progress_count:>4} lines removed")
         print(f"  SessionId updated:   {self.sessionid_count:>4} entries")
         print(
@@ -295,7 +306,7 @@ class CleaningStats:
             f"📦 New size: {new_size:,} bytes ({100 * (1 - new_size / original_size):.1f}% reduction)"
         )
         if new_session_id:
-            resume_cmd_var = f"claude --resume {new_session_id} --verbose"
+            resume_cmd_var = f"claude --resume {new_session_id} --verbose --dangerously-skip-permissions"
             print(f"\n🚀 To resume this cleaned session, run:")
             print(f"   {resume_cmd_var}")
             # pbcopy로 클립보드에 복사 (macOS)
@@ -376,8 +387,12 @@ def get_new_session_id(original_path):
 def clean_thinking(obj, stats):
     """
     Thinking 블록 정리
-    - message.content[0].thinking 삭제
-    - signature는 보존 (검증용)
+    - message.content[0].thinking → placeholder 치환
+    - signature는 보존한다 (절대 건드리지 않음).
+      signature는 Anthropic 서버가 만든 opaque 암호화 서명이라 1바이트라도 바꾸면
+      resume 시 "thinking block cannot be modified" 400 에러가 난다.
+      게다가 signature는 모델 토큰으로 세지 않는 metadata라(차지하는 건 파일 바이트뿐,
+      Claude Code tokenEstimation 기준) 줄여도 컨텍스트 절약 효과가 없다. → 보존이 정답.
     """
     try:
         content = obj.get("message", {}).get("content", [])
@@ -390,6 +405,56 @@ def clean_thinking(obj, stats):
                     stats.thinking_bytes += len(original.encode("utf-8"))
                     first["thinking"] = CLEANED_THINKING
                     return True
+    except Exception:
+        pass
+    return False
+
+
+def clean_attachment(obj, stats):
+    """
+    attachment 정리 (type: attachment 행)
+    두 형태가 공존한다:
+      A) attachment.content가 string → 세션 시작 시 주입되는 skill 목록 등 시스템 텍스트
+         → CLEANED_ATTACHMENT로 치환 (names/skillCount 등 다른 키는 보존)
+      B) attachment.content가 dict → 사용자가 첨부한 파일
+         → attachment.content.file.content를 CLEANED_FILE_CONTENT로 치환,
+           attachment.content.file.filePath는 파일명만으로 변환 (filename 등은 보존)
+    주의: 사용자 발화(message.content, type=user)는 여기서 다루지 않으며 그대로 보존된다.
+    """
+    try:
+        attachment = obj.get("attachment")
+        if not isinstance(attachment, dict):
+            return False
+        content = attachment.get("content")
+        cleaned = False
+        # A) content가 string (주입 텍스트)
+        if isinstance(content, str):
+            if content and content != CLEANED_ATTACHMENT:
+                stats.attachment_count += 1
+                stats.attachment_bytes += len(content.encode("utf-8"))
+                attachment["content"] = CLEANED_ATTACHMENT
+                cleaned = True
+        # B) content가 dict (첨부 파일)
+        elif isinstance(content, dict):
+            file_obj = content.get("file", {})
+            if isinstance(file_obj, dict):
+                if "content" in file_obj:
+                    original = file_obj["content"]
+                    if original and original != CLEANED_FILE_CONTENT:
+                        stats.attachment_count += 1
+                        stats.attachment_bytes += len(original.encode("utf-8"))
+                        file_obj["content"] = CLEANED_FILE_CONTENT
+                        cleaned = True
+                if "filePath" in file_obj:
+                    original_path = file_obj["filePath"]
+                    new_path = basename_only(original_path)
+                    if original_path != new_path:
+                        stats.attachment_bytes += len(
+                            original_path.encode("utf-8")
+                        ) - len(new_path.encode("utf-8"))
+                        file_obj["filePath"] = new_path
+                        cleaned = True
+        return cleaned
     except Exception:
         pass
     return False
@@ -1356,6 +1421,7 @@ def process_line(obj, new_session_id, stats):
 
     # 도구별 클리닝 (순서대로 적용, 각 함수는 독립적이므로 모두 실행)
     clean_thinking(obj, stats)
+    clean_attachment(obj, stats)                # attachment (skill 목록 / 첨부 파일)
     clean_read_result(obj, stats)
     clean_write_input(obj, stats)
     clean_write_result(obj, stats)
