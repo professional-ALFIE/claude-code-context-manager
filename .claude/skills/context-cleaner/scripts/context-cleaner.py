@@ -79,7 +79,7 @@ import re
 def basename_only(path):
     """
     전체 경로에서 파일명만 추출
-    예: /Users/.../runner.ts → runner.ts
+    예: ${HOME}/project/runner.ts → runner.ts
     """
     if path and isinstance(path, str):
         return os.path.basename(path)

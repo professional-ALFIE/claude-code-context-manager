@@ -2,7 +2,7 @@
 # SessionStart hook: session info injection + context-cleaner detection
 # - Every session: echo session info to Claude context + write to CLAUDE_ENV_FILE
 # - Effaced sessions: additional context-cleaner notice
-# - Always: copy resume command to clipboard
+# - The cleaner CLI, not this hook, optionally copies the generated resume command
 
 # stdin에서 JSON 입력 읽기
 input_var=$(cat)

@@ -12,11 +12,11 @@ curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-sk
 
 `~/.claude/skills/context-cleaner/`에 스킬과 스크립트가 설치됩니다.
 
-### SessionStart Hook (필수)
+### SessionStart Hook (자동 탐색에 권장)
 
-이 훅은 **필수**입니다. Claude에게 transcript 경로와 session ID를 제공하고 `CLAUDE_ENV_FILE`로 내보냅니다. 없으면 Claude가 transcript 파일을 찾을 수 없습니다.
+이 훅은 Claude에게 transcript 경로와 session ID를 제공하고 `CLAUDE_ENV_FILE`로 내보냅니다. 훅을 사용하지 않으면 cleaner에 transcript 경로나 session UUID를 직접 전달해야 합니다.
 
-정리된 세션도 **자동 감지**합니다. 세션 ID에 `00effaced`가 포함되어 있으면 정리된 세션이라는 안내를 표시합니다.
+`--fork` 결과도 감지합니다. session ID가 `00effacedNNN`으로 끝나면 정리된 세션이라는 안내를 표시합니다. in-place 정리는 기존 session ID를 유지하므로 bundled hook은 ID만으로 정리 상태를 판단하지 못합니다.
 
 설치 스크립트 실행 후, `~/.claude/settings.json`에 훅을 등록하세요. `hooks` 객체에 `SessionStart` 항목을 추가합니다 (기존 훅은 지우지 마세요):
 
@@ -44,12 +44,12 @@ After all steps, tell me to restart the session.
 
 ## 기능
 
-`.jsonl` 트랜스크립트 파일에서 불필요한 데이터를 제거합니다:
-- Thinking block, 파일 내용, diff, stdout/stderr
+`.jsonl` transcript 파일에서 불필요한 데이터를 제거합니다:
+- thinking-only 행, 파일 내용, diff, stdout/stderr
 - 전체 파일 경로 → 파일명만 유지
-- Hook progress 행, tool result 중복 데이터, meta content (주입된 SKILL.md 등)
+- hook progress·hook summary·hook attachment, synthetic/local-command 행, tool result 중복 데이터, meta content
 
-보존 항목: 대화 텍스트, 편집 의도, 파일명, uuid 체인
+보존 항목: 대화 텍스트, 편집 의도, 파일명, UUID 체인, resume anchor, 갈래 tip
 
 ### 동작 원리
 
@@ -72,13 +72,11 @@ After all steps, tell me to restart the session.
 
 ### 삭제 대상
 
-Claude Code는 모든 동작을 JSONL 트랜스크립트에 기록합니다. 클리너는 대화 구조를 보존하면서 무거운 필드를 가벼운 마커로 치환합니다.
+Claude Code는 모든 동작을 JSONL transcript에 기록합니다. cleaner는 대화 구조를 보존하면서 무거운 필드를 가벼운 marker로 치환하고 가치가 낮은 특정 행을 삭제합니다.
 
 #### Thinking
 
-어시스턴트 응답마다 Extended Thinking 내용이 포함됩니다.
-
-- `message.content[N].thinking` → 치환
+thinking-only assistant 행은 삭제하고 참조를 다시 연결합니다. thinking과 다른 내용이 섞인 행은 보존하고 `message.content[N].thinking` 값만 치환합니다.
 
 #### Read
 
@@ -146,7 +144,7 @@ URL을 가져오면 페이지 전체 내용이 기록됩니다.
 특정 도구에 묶이지 않지만, 클리닝 대상인 항목들입니다.
 
 - **이미지 첨부**: `source.data` base64 → 1x1 투명 PNG로 치환, `source.media_type` → `image/png`
-- **hook_progress**: 줄 전체 삭제 (parentUuid 리매핑으로 uuid 체인 유지)
+- **Hook 행**: `hook_progress`, `stop_hook_summary`, `hook_*` attachment를 기본 삭제하며, `--hooks keep` 또는 event 목록으로 선택 보존
 - **meta 메시지** (isMeta): `content[N].text` → 치환 (주입된 SKILL.md, 시스템 프롬프트 등)
 - **bash 태그**: 사용자 메시지 내 `<bash-stdout>...<bash-stderr>` 패턴 → 치환
 - **사용자 마킹**: `<clean>...</clean>` 패턴 → 치환
@@ -165,21 +163,16 @@ URL을 가져오면 페이지 전체 내용이 기록됩니다.
 
 클리닝 후 상세 리포트가 출력됩니다:
 
-```
-✅ Context Cleaner v5 completed!
-
-📊 Cleaning Statistics:
-  Thinking blocks:       42 cleaned (128,400 bytes)
-  Read results:          18 cleaned (95,200 bytes)
-  ...
-
-💾 Total saved: 892,103 bytes (871.2 KB)
-📦 Original size: 1,245,678 bytes
-📦 New size: 353,575 bytes (71.6% reduction)
-
+```text
+🔄 Mode: in-place — 검증 후 원본 transcript 교체
+✅ Context Cleaner v5 (TS) completed!
+📁 Source: ${HOME}/.claude/projects/.../<session-id>.jsonl
+📁 Output: ${HOME}/.claude/projects/.../<session-id>.jsonl
+📊 Cleaning Statistics (값 치환): ...
+🗑 Row Deletions (행 삭제 + 참조 재연결): ...
 🚀 To resume this cleaned session, run:
-   claude --resume 9c4c1a42-...-00effaced001 --verbose
-📋 Copied to clipboard!
+   cd ${HOME}/project/example && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume <session-id>
+🔎 Verification: PASS
 ```
 
 ## 사용법
@@ -191,8 +184,8 @@ Claude에게 "context clean해줘" 또는 "transcript 정리해줘"라고 말하
 ### CLI로 사용
 
 ```bash
-~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl
-~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl --fork
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts ${HOME}/path/to/session.jsonl
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts ${HOME}/path/to/session.jsonl --fork
 ~/.claude/skills/context-cleaner/scripts/context-cleaner.ts <session-uuid-prefix> --hooks keep
 ```
 
@@ -200,13 +193,13 @@ Claude에게 "context clean해줘" 또는 "transcript 정리해줘"라고 말하
 
 ### 정리된 세션 재개
 
-클리닝 후 resume 명령이 **자동으로 클립보드에 복사**됩니다. 붙여넣기만 하면 됩니다:
+cleaner는 session에 기록된 작업 경로를 사용해 resume 명령을 출력합니다. in-place 모드는 기존 session ID를 유지하고, `--fork`는 새로운 `00effacedNNN` ID를 만듭니다.
 
 ```bash
-claude --resume 9c4c1a42-...-00effaced001 --verbose
+cd ${HOME}/project/example && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume <session-id>
 ```
 
-`--verbose` 플래그를 사용하면 SessionStart 훅 출력(정리된 세션 안내 포함)을 터미널에서 볼 수 있습니다.
+macOS에서는 `pbcopy`가 있을 때 이 명령을 클립보드에도 복사합니다. 클립보드 복사 실패는 무시합니다. `--verbose`는 SessionStart hook 출력을 보여주며, 정리된 세션 안내는 `00effacedNNN`으로 끝나는 `--fork` ID에 자동으로 표시됩니다.
 
 ## 요구사항
 
