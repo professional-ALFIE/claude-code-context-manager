@@ -32,13 +32,13 @@
  *     ③ file-history-snapshot.messageId — /rewind 파일 복원용, user 행 uuid와 1:1
  *     ④ sourceToolAssistantUUID     — tool_result(user 행) → tool_use(assistant 행) 역참조
  *   행을 삭제하면 ①②④는 "살아남은 조상"으로 재매핑하고, ③은 대상이 사라졌으면 스냅샷 행도
- *   함께 삭제한다. 실사례: 씨발새끼야-안됨.jsonl의 첫 last-prompt 앵커(31845162)가 바로
- *   SessionStart 훅 attachment 행이었다 — 훅을 지우면서 ②를 재매핑하지 않으면 앵커가 끊긴다.
+ *   함께 삭제한다. 실제 regression transcript에서 첫 last-prompt 앵커가 SessionStart 훅
+ *   attachment 행을 가리킨 사례가 있었다 — 훅을 지우면서 ②를 재매핑하지 않으면 앵커가 끊긴다.
  *
  * [핵심 원칙 3 — 조상 기반 재연결 (v4 python과 다른 점)]
  *   v4는 삭제된 uuid를 "파일 순서상 직전에 살아남은 행"으로 재연결했다.
  *   평행세계(한 파일에 parentUuid 갈래 여러 개) 파일에서는 파일 순서가 갈래를 넘나들기
- *   때문에, 그 방식은 남의 갈래에 체인을 접붙일 수 있다 (안됨본 구조로 실증된 위험:
+ *   때문에, 그 방식은 남의 갈래에 체인을 접붙일 수 있다 (regression transcript로 실증된 위험:
  *   a갈래 행 사이사이에 b갈래 행이 끼어 있음). v5는 삭제된 행의 "자기 parentUuid 사슬"을
  *   따라 올라가 가장 가까운 살아남은 조상으로 재연결한다. 조상이 전부 삭제됐으면 null(root).
  *
@@ -59,14 +59,14 @@
  *     + signature, 내용만 요약 텍스트)라서 같은 삭제 규칙 하나로 처리된다. (실물 확인: 2026-07-07)
  *   - [thinking+text] 혼합 행은 실측된 적 없음 → 사전 방어 설계 없이 "모든 블록이 thinking류인
  *     행만 삭제"라는 규칙 하나만 둔다. 혼합이 실존하면 자연히 살아남고 통계(mixedThinkingRows)로
- *     보고되므로 그때 처리한다. (주인님 지시: 없는 걸 예상해서 설계하지 말 것)
+ *     보고되므로 실제 사례가 확인된 뒤 처리한다.
  *
  * [지식: 합성(synthetic) 행 — 왜 지우고, 왜 '지울 후보 1순위'인가]
  *   정체: CC가 resume 시 "응답 없이 끝난(pending) user 메시지"를 발견하면, 대화 상태를
  *   정리하려고 스스로 끼워 넣는 가짜 한 쌍이다:
  *     - user 행:      isMeta:true + text "Continue from where you left off."
  *     - assistant 행: message.model = "<synthetic>" (텍스트 "No response requested.")
- *   즉 모델이 생성한 응답도, 사람이 친 입력도 아닌 '접착제'다. (실물: 실험파일 299cb302, 2026-07-06)
+ *   즉 모델이 생성한 응답도, 사람이 친 입력도 아닌 '접착제'다. (실물 transcript에서 확인, 2026-07-06)
  *   지울 후보 1순위인 이유:
  *     ① 대화 정보량이 0 — 흐름 기억에 기여하는 바이트가 한 글자도 없다.
  *     ② resume을 반복할 때마다 쌓인다 — 평행세계 운용(자주 열고 닫음)에서 순수 오염원.
@@ -99,7 +99,7 @@
  *     - fix-session의 고아 정의: "부모가 대화 타입({user,assistant,system,summary})이 아니면
  *       고아로 보고 재연결" — 이는 옛 버그(#22107, progress uuid 오염) 수리용 정의다.
  *       v2.1.201 정상 파일에서는 user 행의 부모가 system(turn_duration)/attachment인 것이
- *       "정상"임을 실측했다(안됨본). 그 정의를 그대로 쓰면 건강한 체인을 오히려 파괴한다.
+ *       "정상"임을 regression transcript에서 실측했다. 그 정의를 그대로 쓰면 건강한 체인을 오히려 파괴한다.
  *       → v5의 고아 정의는 "파일 안 어떤 uuid로도 해소되지 않는 parentUuid"뿐이다.
  *     - 파일 순서 기반 재연결 → [핵심 원칙 3]의 조상 기반으로 대체.
  *
@@ -1226,7 +1226,7 @@ export function verifyAgainstBaseline(inputLines: string[], outputLines: string[
   //   roots===0은 잡지 않는다: 클리너는 user/assistant 대화 행을 삭제하지 않으므로(설계 불변)
   //   "대화 통째 소멸"은 구조적으로 불가능하다. --hooks keep 계열에선 첫 user의 parent가 살아있는
   //   훅 attachment라 정상임에도(F_기각) "대화타입 + parentUuid null"인 root가 0개로 세이는
-  //   케이스가 있어, ===0 판정은 정상 파일을 오잡하는 역할만 한다 (안됨본 keep/sessionstart 실측).
+  //   케이스가 있어, ===0 판정은 정상 파일을 오잡하는 역할만 한다 (regression transcript의 keep/sessionstart에서 실측).
   if (output.conversationRootCount > 1)
     problems.push(`다중 root ${output.conversationRootCount}개 (파편 root 발생)`);
   // §5.3 resume 앵커(마지막 last-prompt.leafUuid) — CC가 실제로 열 갈래의 건강도
@@ -1319,7 +1319,7 @@ export function lastCwd(rows: ReadonlyArray<{ o: Record<string, any> | null }>):
  * 실행하는 터미널의 셸이 그 자리에서 자기 홈으로 확장하므로, 어느 머신·어느 사용자명에서
  * 붙여넣어도 통한다 (기록된 cwd는 기록 당시 머신의 절대경로이므로).
  *  - 현재 홈으로 시작하면 그대로 토큰화.
- *  - 다른 홈(/Users/<이름>/…, /home/<이름>/…)이면 "현재 홈 기준으로 실존할 때만" 토큰화 —
+ *  - 다른 계정의 홈 경로이면 "현재 홈 기준으로 실존할 때만" 토큰화 —
  *    진짜 다른 계정의 경로를 엉뚱한 곳으로 틀어버리는 오치환 방지.
  *    실존 안 하면 원문 유지(cd 실패가 눈에 보이도록).
  *  - 주의: ${HOME}은 홑따옴표 안에서 확장되지 않는다 — 인용은 buildResumeCommand가

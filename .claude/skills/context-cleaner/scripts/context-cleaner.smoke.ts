@@ -5,11 +5,10 @@
  * instruct--testing 지침 적용:
  * - §2 테스트 먼저 작성 (이 파일이 본체보다 먼저 작성됨 — Red 확인 후 구현)
  * - §3 격리: 본체를 import해서 내부 함수(cleanTranscript)를 직접 호출
- * - §4 Integration: 실제 transcript 3종으로 전체 흐름(파싱→클리닝→삭제→재매핑→검증→쓰기)을 돌림
+ * - §4 Integration: fixture와 선택적으로 주입된 실물 transcript로 전체 흐름(파싱→클리닝→삭제→재매핑→검증→쓰기)을 돌림
  * - §5 관찰 가능성: 단계별 로그 + 경과 시간
  * - §6 에러 경로: 없는 파일 / 깨진 JSON 줄 / 플래그 파싱
- * - §8 산출물 보존이 "기본값" — 주인님 전역 규칙(테스트 산출물 삭제 금지)이 스킬 §8 기본값(자체 정리)보다
- *      우선하므로 여기서는 보존이 기본. CLEAN_ARTIFACTS=1 줄 때만 정리.
+ * - §8 산출물 보존이 기본값 — 저장소의 회귀 분석 정책에 따라 CLEAN_ARTIFACTS=1일 때만 정리.
  * - §12 안전장치: 실물 세션 테스트는 --fork로 고정해 원본 불변을 검증하고, in-place는 사본 fixture에서만 검증
  * - §14 동작 검증: 출력 파일의 행 구성(입력→출력)만 검증, 내부 구현 세부는 검증하지 않음
  * - §15 각 테스트는 Arrange→Act→Assert 구조
@@ -22,19 +21,15 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
 
-// ── 대상 실물 transcript (주인님 지정 3세션 + 안됨본) ──
-// projects 안 파일은 절대경로 하드코딩 대신 uuid로 런타임 해석한다 —
-// 사용자명 이주(noseung-gyeong → nsk_intel_mac)로 프로젝트 폴더명이 바뀌어도 견딘다.
-// (해석은 main() 안에서 resolveTranscriptArg로 — 본체 import 뒤에만 가능)
-//
-// 실물 3세션(2026-07-09 주인님 지정 — 전부 원본 상태, 감량·체인 모두 건강):
-//   감량 60~65%, orphan=0 cycle=0. T5 루프로 3개 회귀 동시 검증.
-const 이번세션uuid들 = [
-  "d5f64264-6d99-4396-b0cd-4371a67f8521",
-  "b999ad38-07c4-4874-94a6-251ca4644764",
-  "317f2aea-8ea0-4018-ae24-3251d90f0d5d",
-];
-const 안됨본 = `${os.homedir()}/project/issue-00-ssh-19mbp/씨발새끼야-안됨.jsonl`; // projects 밖 — $HOME 기준(사용자명 이주 무관)
+// ── 선택적 실물 transcript integration ──
+// 공개 저장소에 개인 경로·세션 ID를 넣지 않는다. 필요한 경우 실행 환경에서 주입한다.
+//   CONTEXT_CLEANER_REGRESSION_TRANSCRIPT=${HOME}/path/to/regression.jsonl
+//   CONTEXT_CLEANER_REAL_SESSION_IDS=<uuid1>,<uuid2>,<uuid3>
+const regressionTranscript = process.env.CONTEXT_CLEANER_REGRESSION_TRANSCRIPT?.trim() ?? "";
+const realSessionIds = (process.env.CONTEXT_CLEANER_REAL_SESSION_IDS ?? "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
 
 const FIXTURE = fileURLToPath(new URL("./fixtures-smoke-malformed.jsonl", import.meta.url));
 
@@ -126,16 +121,20 @@ async function main() {
   const artifacts: string[] = [];
 
   // T1 ───────────────────────────────────────────────────────────────
-  await test("T1 기본(--hooks delete): 안됨본에서 훅·think 행이 전부 사라지고 체인이 온전하다", async () => {
+  await test("T1 기본(--hooks delete): regression transcript에서 훅·think 행이 전부 사라지고 체인이 온전하다", async () => {
+    if (!regressionTranscript) {
+      console.log("    ⏭ CONTEXT_CLEANER_REGRESSION_TRANSCRIPT 미설정 — 선택적 실물 검증 건너뜀");
+      return;
+    }
     // Arrange
-    const srcHash = sha(안됨본);
-    const before = rows(안됨본);
+    const srcHash = sha(regressionTranscript);
+    const before = rows(regressionTranscript);
     const beforeLeaves = leafUuids(before);
     // Act
-    const res = await cleanTranscript(안됨본, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    const res = await cleanTranscript(regressionTranscript, { hooks: parseHooksFlag(undefined), mode: "fork" });
     // Assert
     assert(res.ok === true, "클리닝 성공(ok=true)");
-    assert(sha(안됨본) === srcHash, "원본 파일 바이트 불변 (§12)");
+    assert(sha(regressionTranscript) === srcHash, "원본 파일 바이트 불변 (§12)");
     assert(!!res.outputPath && existsSync(res.outputPath), `출력 파일 생성됨: ${res.outputPath}`);
     if (!res.outputPath) return;
     artifacts.push(res.outputPath);
@@ -170,9 +169,13 @@ async function main() {
 
   // T2 ───────────────────────────────────────────────────────────────
   await test("T2 --hooks keep: 훅 행은 전부 살아남고 think 행만 사라진다", async () => {
-    const before = rows(안됨본);
+    if (!regressionTranscript) {
+      console.log("    ⏭ CONTEXT_CLEANER_REGRESSION_TRANSCRIPT 미설정 — 선택적 실물 검증 건너뜀");
+      return;
+    }
+    const before = rows(regressionTranscript);
     const hookCountBefore = before.filter((r) => isHookRow(r.o)).length;
-    const res = await cleanTranscript(안됨본, { hooks: parseHooksFlag("keep"), mode: "fork" });
+    const res = await cleanTranscript(regressionTranscript, { hooks: parseHooksFlag("keep"), mode: "fork" });
     assert(res.ok === true, "클리닝 성공");
     if (!res.outputPath) return;
     artifacts.push(res.outputPath);
@@ -187,7 +190,11 @@ async function main() {
 
   // T3 ───────────────────────────────────────────────────────────────
   await test("T3 --hooks sessionstart: SessionStart 훅만 살고 Stop 훅(stop_hook_summary)은 삭제된다", async () => {
-    const res = await cleanTranscript(안됨본, { hooks: parseHooksFlag("sessionstart"), mode: "fork" });
+    if (!regressionTranscript) {
+      console.log("    ⏭ CONTEXT_CLEANER_REGRESSION_TRANSCRIPT 미설정 — 선택적 실물 검증 건너뜀");
+      return;
+    }
+    const res = await cleanTranscript(regressionTranscript, { hooks: parseHooksFlag("sessionstart"), mode: "fork" });
     assert(res.ok === true, "클리닝 성공");
     if (!res.outputPath) return;
     artifacts.push(res.outputPath);
@@ -204,7 +211,7 @@ async function main() {
   });
 
   // T4 ───────────────────────────────────────────────────────────────
-  // 이 테스트는 과거 실물 세션(299cb302, 2026-07-06)에서 온 회귀다.
+  // 이 테스트는 과거 실물 세션에서 발견한 회귀를 fixture로 재현한다.
   // 그 파일은 synthetic 행들에도 attachment 자식이 붙어 있어 synthetic 자체가 leaf가 아니었다.
   // 따라서 "tip 개수"가 아니라 "synthetic uuid를 제외한 원본 tip이 출력에서도 tip으로 보존되는지"를 본다.
   // 지금은 실물 세션 구조 변화에 흔들리지 않도록 같은 의미를 fixture로 재현한다.
@@ -257,9 +264,13 @@ async function main() {
   });
 
   // T5 ───────────────────────────────────────────────────────────────
-  // 실물 3세션(주인님 지정) 각각: 30%+ 감량 + verify ok + 원본 불변. 한 번에 회귀 3종 확보.
-  await test("T5 세 실물 세션: 각각 30%+ 감량 + verify ok + 원본 불변", async () => {
-    for (const uuid of 이번세션uuid들) {
+  // 환경변수로 주입한 실물 세션 각각: 30%+ 감량 + verify ok + 원본 불변.
+  await test("T5 환경변수 실물 세션: 각각 30%+ 감량 + verify ok + 원본 불변", async () => {
+    if (realSessionIds.length === 0) {
+      console.log("    ⏭ CONTEXT_CLEANER_REAL_SESSION_IDS 미설정 — 선택적 실물 검증 건너뜀");
+      return;
+    }
+    for (const uuid of realSessionIds) {
       const p = 해석(uuid);
       const tag = uuid.slice(0, 8);
       const srcHash = sha(p);
@@ -337,19 +348,24 @@ async function main() {
     assert(r5.ok === false, "매칭 없음 → 에러");
     const r6 = resolveTranscriptArg("스크립트아님!!", ROOT);
     assert(r6.ok === false, "uuid 형태도 경로도 아님 → 에러");
-    // 실전 projects 루트 (기본값 경로): 실물 세션이 있으면 실제 해석까지 확인
-    const 실물uuid = "299cb302-b688-4292-a9bc-e1fadfc14e77";
-    const rReal = resolveTranscriptArg(실물uuid);
-    if (rReal.ok) assert(rReal.path.endsWith(`${실물uuid}.jsonl`), `실전 루트에서 실물 세션 해석: ${rReal.path}`);
-    else console.log("   (실물 세션 파일 부재 — 실전 루트 검증 건너뜀)");
+    // 실전 projects 루트는 환경변수로 받은 세션 ID가 있을 때만 확인한다.
+    const realSessionId = realSessionIds[0];
+    if (realSessionId) {
+      const rReal = resolveTranscriptArg(realSessionId);
+      assert(rReal.ok && rReal.path.endsWith(`${realSessionId}.jsonl`), `실전 루트에서 실물 세션 해석: ${rReal.ok ? rReal.path : rReal.error}`);
+    } else {
+      console.log("    ⏭ CONTEXT_CLEANER_REAL_SESSION_IDS 미설정 — 실전 루트 검증 건너뜀");
+    }
   });
 
   // T8 ───────────────────────────────────────────────────────────────
   await test("T8 resume 문구: cd <세션cwd> && claude … 형태 + e2e에서 resumeCommand 반환", async () => {
     // 단위: 템플릿·따옴표·cwd 부재 폴백
-    const cmd1 = buildResumeCommand("/Users/x/proj", "id-123");
+    const home = os.homedir();
+    const homeProject = path.join(home, "project");
+    const cmd1 = buildResumeCommand(homeProject, "id-123");
     assert(
-      cmd1 === "cd /Users/x/proj && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume id-123",
+      cmd1 === `cd ${homeProject} && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume id-123`,
       `기본 템플릿 (실제: ${cmd1})`,
     );
     assert(buildResumeCommand(null, "id-123").startsWith("claude "), "cwd 부재 → cd 없이 폴백");
@@ -358,13 +374,16 @@ async function main() {
     const cmd3 = buildResumeCommand("${HOME}/project/x", "id-123");
     assert(cmd3.startsWith("cd ${HOME}/project/x &&"), `\${HOME} 토큰 경로는 따옴표 없이 그대로 (실제: ${cmd3})`);
     // 단위: 홈 접두 → 리터럴 ${HOME} 토큰 (실행 터미널에서 확장 — 이식형)
-    const home = os.homedir();
+    const alternateHome = path.join(path.dirname(home), "context-cleaner-other-user");
+    const currentRelativeCwd = process.cwd().startsWith(home + path.sep) ? process.cwd().slice(home.length) : "";
+    const alternateExistingPath = alternateHome + currentRelativeCwd;
     assert(
-      normalizeHomePrefix("/Users/옛사용자명/project/issue-00-ssh-19mbp") === "${HOME}/project/issue-00-ssh-19mbp",
-      "옛 홈 접두 → 리터럴 ${HOME} 토큰 (치환 결과 실존)",
+      normalizeHomePrefix(alternateExistingPath) === "${HOME}" + currentRelativeCwd,
+      "다른 홈 접두 → 리터럴 ${HOME} 토큰 (치환 결과 실존)",
     );
+    const alternateMissingPath = path.join(alternateHome, "context-cleaner-path-does-not-exist");
     assert(
-      normalizeHomePrefix("/Users/someone/이런폴더는없음-xyz") === "/Users/someone/이런폴더는없음-xyz",
+      normalizeHomePrefix(alternateMissingPath) === alternateMissingPath,
       "치환 결과가 실존하지 않으면 원문 유지 (오치환 방지)",
     );
     assert(normalizeHomePrefix(`${home}/project`) === "${HOME}/project", "현재 홈 접두도 ${HOME} 토큰화");
@@ -381,16 +400,17 @@ async function main() {
     // e2e: cwd 있는 fixture를 클리닝하면 resumeCommand가 세션 cwd로 조립됨
     const FIXTURE3 = FIXTURE.replace("malformed", "cwd");
     const sid = "fixture-0000-0000-0000-000000000002";
+    const fixtureCwd = path.join(home, "context-cleaner 작업 폴더");
     writeFileSync(FIXTURE3, [
-      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "질문" }, uuid: "u-1", timestamp: "2026-07-07T00:00:00.000Z", sessionId: sid, cwd: "/Users/x/작업 폴더" }),
-      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "응답" }] }, uuid: "a-1", timestamp: "2026-07-07T00:00:01.000Z", sessionId: sid, cwd: "/Users/x/작업 폴더" }),
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "질문" }, uuid: "u-1", timestamp: "2026-07-07T00:00:00.000Z", sessionId: sid, cwd: fixtureCwd }),
+      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "응답" }] }, uuid: "a-1", timestamp: "2026-07-07T00:00:01.000Z", sessionId: sid, cwd: fixtureCwd }),
     ].join("\n") + "\n");
     const res = await cleanTranscript(FIXTURE3, { hooks: parseHooksFlag(undefined), mode: "fork" });
     assert(res.ok === true, "cwd fixture 클리닝 성공");
     if (res.outputPath) artifacts.push(res.outputPath);
     assert(
-      res.resumeCommand === `cd "/Users/x/작업 폴더" && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume ${res.newSessionId}`,
-      `e2e resumeCommand 조립 — 실존 않는 타계정 경로라 토큰화 없이 겹따옴표 (실제: ${res.resumeCommand})`,
+      res.resumeCommand === `cd "\${HOME}/context-cleaner 작업 폴더" && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume ${res.newSessionId}`,
+      `e2e resumeCommand 조립 — 현재 홈은 \${HOME} 토큰화하고 공백 경로는 겹따옴표 처리 (실제: ${res.resumeCommand})`,
     );
   });
 
@@ -576,7 +596,7 @@ async function main() {
     assert(sha(WORK) === beforeHash, "CLI 실패 시 원본 내용 무손상");
   });
 
-  // ── 정리 (§8 역전: 보존이 기본 — 주인님 전역 규칙 우선) ──
+  // ── 정리 (§8: 회귀 분석을 위해 보존이 기본) ──
   if (process.env.CLEAN_ARTIFACTS === "1") {
     for (const a of artifacts) if (existsSync(a)) unlinkSync(a);
     console.log(`\n🧹 CLEAN_ARTIFACTS=1 → 산출물 ${artifacts.length}개 삭제`);

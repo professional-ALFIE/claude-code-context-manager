@@ -12,11 +12,11 @@ curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-sk
 
 This installs the skill and scripts to `~/.claude/skills/context-cleaner/`.
 
-### SessionStart Hook (Required)
+### SessionStart Hook (Recommended for automatic discovery)
 
-This hook is **required** — it provides the transcript path and session ID to Claude and exports them through `CLAUDE_ENV_FILE`. Without it, Claude cannot locate the transcript file.
+This hook provides the transcript path and session ID to Claude and exports them through `CLAUDE_ENV_FILE`. Without it, pass a transcript path or session UUID to the cleaner manually.
 
-It also **auto-detects** cleaned sessions: when a session ID contains `00effaced`, the hook displays a notice explaining what was preserved and removed.
+It also detects `--fork` results: when a session ID ends in `00effacedNNN`, the hook displays a cleaned-session notice. In-place cleaning preserves the original session ID, so the bundled hook does not infer that state from the ID alone.
 
 After running the install script, register the hook in `~/.claude/settings.json`. Add the `SessionStart` entry to the `hooks` object (don't remove existing hooks):
 
@@ -45,11 +45,11 @@ After all steps, tell me to restart the session.
 ## What it does
 
 Strips bulky data from `.jsonl` transcript files:
-- Thinking blocks, file contents, diffs, stdout/stderr
+- Thinking-only rows, file contents, diffs, stdout/stderr
 - Full file paths → filenames only
-- Hook progress lines, tool result duplicates, meta content (injected SKILL.md, etc.)
+- Hook progress, hook summaries and hook attachments; synthetic/local-command rows; tool result duplicates; meta content
 
-Preserves: conversation text, edit intent, filenames, uuid chain.
+Preserves: conversation text, edit intent, filenames, UUID chains, resume anchors, and branch tips.
 
 ### How it works
 
@@ -72,13 +72,11 @@ Re-clean:  9c4c1a42-...-00effaced002.jsonl  (number increments)
 
 ### What gets cleaned
 
-Claude Code records every action to a JSONL transcript. The cleaner replaces bulky fields with lightweight markers while preserving conversation structure.
+Claude Code records every action to a JSONL transcript. The cleaner replaces bulky fields with lightweight markers and deletes specific low-value rows while preserving conversation structure.
 
 #### Thinking
 
-Each assistant response includes Extended Thinking content.
-
-- `message.content[N].thinking` → replaced
+Thinking-only assistant rows are deleted and their references are remapped. If a row contains both thinking and non-thinking content, the row is preserved and only `message.content[N].thinking` is replaced.
 
 #### Read
 
@@ -146,7 +144,7 @@ Exiting plan mode records the plan text.
 Not tied to a specific tool, but still cleaned.
 
 - **Image attachments**: `source.data` base64 → 1x1 transparent PNG, `source.media_type` → `image/png`
-- **hook_progress**: entire line deleted (uuid chain preserved via parentUuid remapping)
+- **Hook rows**: `hook_progress`, `stop_hook_summary`, and `hook_*` attachments are deleted by default; `--hooks keep` or an event list preserves selected rows
 - **Meta messages** (isMeta): `content[N].text` → replaced (injected SKILL.md, system prompts, etc.)
 - **Bash tags**: `<bash-stdout>...<bash-stderr>` patterns in user messages → replaced
 - **User-marked content**: `<clean>...</clean>` patterns → replaced
@@ -165,21 +163,16 @@ Wrap any part of your prompt with `<clean>...</clean>` tags to mark it for delet
 
 After cleaning, you get a detailed report:
 
-```
-✅ Context Cleaner v5 completed!
-
-📊 Cleaning Statistics:
-  Thinking blocks:       42 cleaned (128,400 bytes)
-  Read results:          18 cleaned (95,200 bytes)
-  ...
-
-💾 Total saved: 892,103 bytes (871.2 KB)
-📦 Original size: 1,245,678 bytes
-📦 New size: 353,575 bytes (71.6% reduction)
-
+```text
+🔄 Mode: in-place — original transcript replaced after verification
+✅ Context Cleaner v5 (TS) completed!
+📁 Source: ${HOME}/.claude/projects/.../<session-id>.jsonl
+📁 Output: ${HOME}/.claude/projects/.../<session-id>.jsonl
+📊 Cleaning Statistics (field replacements): ...
+🗑 Row Deletions (deletion + reference remapping): ...
 🚀 To resume this cleaned session, run:
-   claude --resume 9c4c1a42-...-00effaced001 --verbose
-📋 Copied to clipboard!
+   cd ${HOME}/project/example && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume <session-id>
+🔎 Verification: PASS
 ```
 
 ## Usage
@@ -191,8 +184,8 @@ Just tell Claude: "context clean해줘" or "transcript 정리해줘"
 ### Via CLI
 
 ```bash
-~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl
-~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl --fork
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts ${HOME}/path/to/session.jsonl
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts ${HOME}/path/to/session.jsonl --fork
 ~/.claude/skills/context-cleaner/scripts/context-cleaner.ts <session-uuid-prefix> --hooks keep
 ```
 
@@ -200,13 +193,13 @@ The default mode is atomic in-place replacement. Use `--fork` when comparing res
 
 ### Resume cleaned session
 
-After cleaning, the resume command is **automatically copied to your clipboard**. Just paste and run:
+The cleaner prints a resume command using the session's recorded working directory. In-place mode keeps the original session ID; `--fork` produces a new `00effacedNNN` ID.
 
 ```bash
-claude --resume 9c4c1a42-...-00effaced001 --verbose
+cd ${HOME}/project/example && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume <session-id>
 ```
 
-The `--verbose` flag lets you see the SessionStart hook output (including the cleaned session notice) in the terminal.
+On macOS, the CLI also copies this command when `pbcopy` is available. Clipboard failure is ignored. The `--verbose` flag shows SessionStart hook output; the cleaned-session notice appears automatically for `--fork` IDs ending in `00effacedNNN`.
 
 ## Requirements
 
