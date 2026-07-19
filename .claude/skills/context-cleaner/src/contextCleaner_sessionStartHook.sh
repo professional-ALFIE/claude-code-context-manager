@@ -19,10 +19,10 @@ if [ -n "$CLAUDE_ENV_FILE" ]; then
   echo "export TRANSCRIPT_PATH=\"$transcript_path_var\"" >> "$CLAUDE_ENV_FILE"
 fi
 
-# resume 명령어를 클립보드에 복사
-resume_cmd_var="claude --resume $session_id_var --verbose"
-echo "$resume_cmd_var" | pbcopy
-echo "Copied to clipboard: $resume_cmd_var"
+# # resume 명령어를 클립보드에 복사
+# resume_cmd_var="claude --resume $session_id_var --verbose"
+# echo "$resume_cmd_var" | pbcopy
+# echo "Copied to clipboard: $resume_cmd_var"
 
 # 00effaced{NNN} 패턴 확인 (context-cleaner로 정리된 세션)
 last_12_var="${session_id_var: -12}"

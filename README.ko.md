@@ -14,7 +14,7 @@ curl -sL https://raw.githubusercontent.com/professional-ALFIE/context-cleaner-sk
 
 ### SessionStart Hook (필수)
 
-이 훅은 **필수**입니다. Claude에게 트랜스크립트 경로를 제공하고, resume 명령을 클립보드에 복사합니다. 없으면 Claude가 트랜스크립트 파일을 찾을 수 없습니다.
+이 훅은 **필수**입니다. Claude에게 transcript 경로와 session ID를 제공하고 `CLAUDE_ENV_FILE`로 내보냅니다. 없으면 Claude가 transcript 파일을 찾을 수 없습니다.
 
 정리된 세션도 **자동 감지**합니다. 세션 ID에 `00effaced`가 포함되어 있으면 정리된 세션이라는 안내를 표시합니다.
 
@@ -54,12 +54,12 @@ After all steps, tell me to restart the session.
 ### 동작 원리
 
 1. **클리닝** — 무거운 데이터(thinking, 파일 내용, bash 출력 등)를 제거하고 `[context-cleaner: Read]` 같은 가벼운 마커로 대체합니다
-2. **새 파일 생성** — 원본 파일은 그대로 유지됩니다. `00effaced`가 포함된 새 파일이 생성됩니다 ("effaced" = 지워진/사라진)
+2. **기본값은 원자적 in-place 교체** — 검증을 통과한 경우에만 정리본으로 원본을 교체합니다. 원본을 보존하고 `00effaced` 사본을 만들려면 `--fork`를 사용합니다
 3. **uuid 체인 유지** — 줄이 삭제되면 `parentUuid` 참조를 리매핑해서 대화 트리가 깨지지 않습니다. `claude --resume`이 정상 작동합니다
-4. **sessionId 통일** — 모든 `sessionId`를 새 파일명과 일치시켜 세션 감지 문제를 방지합니다
-5. **resume 명령 자동 복사** — 클리닝 후 `claude --resume <new_id> --verbose`가 자동으로 클립보드에 복사됩니다 (macOS)
+4. **resume 상태 보존** — 행 삭제 시 `last-prompt.leafUuid`, `sourceToolAssistantUUID`, snapshot과 parent 참조를 다시 연결합니다
+5. **교체 전 검증** — 고아 참조, cycle, 끊어진 참조, 대화 root와 resume anchor를 검사한 뒤에만 in-place rename을 수행합니다
 
-### 파일명 규칙
+### `--fork` 파일명 규칙
 
 ```
 원본:      9c4c1a42-...-239d2e110282.jsonl
@@ -166,7 +166,7 @@ URL을 가져오면 페이지 전체 내용이 기록됩니다.
 클리닝 후 상세 리포트가 출력됩니다:
 
 ```
-✅ Context Cleaner v2 completed!
+✅ Context Cleaner v5 completed!
 
 📊 Cleaning Statistics:
   Thinking blocks:       42 cleaned (128,400 bytes)
@@ -191,8 +191,12 @@ Claude에게 "context clean해줘" 또는 "transcript 정리해줘"라고 말하
 ### CLI로 사용
 
 ```bash
-~/.claude/skills/context-cleaner/scripts/context-cleaner.py /path/to/session.jsonl
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts /path/to/session.jsonl --fork
+~/.claude/skills/context-cleaner/scripts/context-cleaner.ts <session-uuid-prefix> --hooks keep
 ```
+
+기본 모드는 원자적 in-place 교체입니다. 결과를 비교하거나 원본 transcript를 보존해야 할 때는 `--fork`를 사용합니다. Python 구현은 v4 레거시 및 rollback 용도로만 보존합니다.
 
 ### 정리된 세션 재개
 
@@ -206,6 +210,6 @@ claude --resume 9c4c1a42-...-00effaced001 --verbose
 
 ## 요구사항
 
-- Python 3
+- Bun
 - `jq` (훅 스크립트용)
-- macOS (클립보드 복사 — 훅과 클리너 스크립트에서 사용)
+- macOS (`pbcopy` 지원은 선택 사항)
