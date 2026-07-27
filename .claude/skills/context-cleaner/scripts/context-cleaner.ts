@@ -2,10 +2,20 @@
 /**
  * Context Cleaner v5 (TypeScript) — Claude Code 세션 transcript 최적화 도구
  *
- * 목적: "상세 변경내역은 몰라도, 흐름은 기억나도록"
- *   - 값 치환: thinking 블록(혼합 행 한정), 도구 입출력, attachment, 파일 전체경로 → placeholder
+ * 목적: "상세 변경내역은 몰라도, 흐름은 기억나도록 + 다시 해볼 수는 있도록"
+ *   - 값 치환: thinking 블록(혼합 행 한정), 도구 "결과", attachment 내용, base64 이미지 → placeholder
  *   - 행 삭제(v5 신규): thinking-only 행 / 훅 행 3형태(--hooks 스위치) / 합성 행 / (v4 계승) 로컬커맨드 행
- *   - 보존: 대화 텍스트, 사용자 발화, 편집 의도, 파일명, uuid 체인, last-prompt 행, summary 행
+ *   - 보존: 대화 텍스트, 사용자 발화, 편집 의도, uuid 체인, last-prompt 행, summary 행,
+ *           ★ bash command 전문, ★ 파일 전체 경로   ← 2026-07-28 추가 (아래 [결정] 2개 절 참조)
+ *
+ * 무엇을 지우고 무엇을 남기나 (2026-07-28 현재):
+ *   지운다  bash stdout/stderr · Read 파일내용 · Edit old/new_string · Write content ·
+ *           tool_result · Task output · base64 이미지 · thinking · 훅 행 · 합성 행
+ *   남긴다  bash command 전문 · Read/Edit/Write의 전체 경로 · Bash description ·
+ *           Task description · row.cwd · 대화 텍스트 전부
+ *   근거    "결과는 요약으로 대체되지만, 재현 수단(명령·경로)은 요약으로 복원되지 않는다."
+ *           실측상 남기는 쪽 비용은 명령 1.70% + 경로 0.05% 로 작고,
+ *           지우는 쪽(출력)이 명령의 2.8배라 감량 효과는 그대로다 (68.8% 감소 유지).
  *
  * 기본은 원본 파일을 in-place로 정리본과 교체한다. 원본 보존이 필요하면 --fork로
  * 00effaced{NNN} suffix의 사본을 만든다.
@@ -32,13 +42,13 @@
  *     ③ file-history-snapshot.messageId — /rewind 파일 복원용, user 행 uuid와 1:1
  *     ④ sourceToolAssistantUUID     — tool_result(user 행) → tool_use(assistant 행) 역참조
  *   행을 삭제하면 ①②④는 "살아남은 조상"으로 재매핑하고, ③은 대상이 사라졌으면 스냅샷 행도
- *   함께 삭제한다. 실제 regression transcript에서 첫 last-prompt 앵커가 SessionStart 훅
- *   attachment 행을 가리킨 사례가 있었다 — 훅을 지우면서 ②를 재매핑하지 않으면 앵커가 끊긴다.
+ *   함께 삭제한다. 실사례: 씨발새끼야-안됨.jsonl의 첫 last-prompt 앵커(31845162)가 바로
+ *   SessionStart 훅 attachment 행이었다 — 훅을 지우면서 ②를 재매핑하지 않으면 앵커가 끊긴다.
  *
  * [핵심 원칙 3 — 조상 기반 재연결 (v4 python과 다른 점)]
  *   v4는 삭제된 uuid를 "파일 순서상 직전에 살아남은 행"으로 재연결했다.
  *   평행세계(한 파일에 parentUuid 갈래 여러 개) 파일에서는 파일 순서가 갈래를 넘나들기
- *   때문에, 그 방식은 남의 갈래에 체인을 접붙일 수 있다 (regression transcript로 실증된 위험:
+ *   때문에, 그 방식은 남의 갈래에 체인을 접붙일 수 있다 (안됨본 구조로 실증된 위험:
  *   a갈래 행 사이사이에 b갈래 행이 끼어 있음). v5는 삭제된 행의 "자기 parentUuid 사슬"을
  *   따라 올라가 가장 가까운 살아남은 조상으로 재연결한다. 조상이 전부 삭제됐으면 null(root).
  *
@@ -59,14 +69,14 @@
  *     + signature, 내용만 요약 텍스트)라서 같은 삭제 규칙 하나로 처리된다. (실물 확인: 2026-07-07)
  *   - [thinking+text] 혼합 행은 실측된 적 없음 → 사전 방어 설계 없이 "모든 블록이 thinking류인
  *     행만 삭제"라는 규칙 하나만 둔다. 혼합이 실존하면 자연히 살아남고 통계(mixedThinkingRows)로
- *     보고되므로 실제 사례가 확인된 뒤 처리한다.
+ *     보고되므로 그때 처리한다. (주인님 지시: 없는 걸 예상해서 설계하지 말 것)
  *
  * [지식: 합성(synthetic) 행 — 왜 지우고, 왜 '지울 후보 1순위'인가]
  *   정체: CC가 resume 시 "응답 없이 끝난(pending) user 메시지"를 발견하면, 대화 상태를
  *   정리하려고 스스로 끼워 넣는 가짜 한 쌍이다:
  *     - user 행:      isMeta:true + text "Continue from where you left off."
  *     - assistant 행: message.model = "<synthetic>" (텍스트 "No response requested.")
- *   즉 모델이 생성한 응답도, 사람이 친 입력도 아닌 '접착제'다. (실물 transcript에서 확인, 2026-07-06)
+ *   즉 모델이 생성한 응답도, 사람이 친 입력도 아닌 '접착제'다. (실물: 실험파일 299cb302, 2026-07-06)
  *   지울 후보 1순위인 이유:
  *     ① 대화 정보량이 0 — 흐름 기억에 기여하는 바이트가 한 글자도 없다.
  *     ② resume을 반복할 때마다 쌓인다 — 평행세계 운용(자주 열고 닫음)에서 순수 오염원.
@@ -99,9 +109,41 @@
  *     - fix-session의 고아 정의: "부모가 대화 타입({user,assistant,system,summary})이 아니면
  *       고아로 보고 재연결" — 이는 옛 버그(#22107, progress uuid 오염) 수리용 정의다.
  *       v2.1.201 정상 파일에서는 user 행의 부모가 system(turn_duration)/attachment인 것이
- *       "정상"임을 regression transcript에서 실측했다. 그 정의를 그대로 쓰면 건강한 체인을 오히려 파괴한다.
+ *       "정상"임을 실측했다(안됨본). 그 정의를 그대로 쓰면 건강한 체인을 오히려 파괴한다.
  *       → v5의 고아 정의는 "파일 안 어떤 uuid로도 해소되지 않는 parentUuid"뿐이다.
  *     - 파일 순서 기반 재연결 → [핵심 원칙 3]의 조상 기반으로 대체.
+ *
+ * [결정: bash command 보존] (2026-07-28, 주인님 지시)
+ *   Bash tool_use의 input.command 는 "지우지 않는다". 출력(stdout/stderr)만 지운다.
+ *   실측(이 결정을 내린 세션, 1526행 4249KB 기준):
+ *     bash command  167개 / 72.4 KB / 약 20,600 tok / 전체의 1.70%
+ *     bash 출력     171개 / 199.6 KB / 약 56,800 tok  ← 이건 계속 지운다 (명령의 2.8배)
+ *   왜 살리나: 명령어에는 "어떤 옵션 조합으로 무엇을 알아냈는지"가 들어 있어 재현 가치가 크다.
+ *     특히 필드 오프셋·정규식·파이프 조합 같은 시행착오는 응답 텍스트로 요약해도 복원이 안 된다.
+ *     실제 사례 — awk로 로그를 집계할 때 "$(NF-4)처럼 뒤에서부터 센 이유(주파수 칸이
+ *     '1900.00 Mhz'라 공백 포함 → 필드가 밀림)"가 명령 안 주석에만 있었고, 지우면 같은 함정을
+ *     다시 밟는다. 1.7%를 내고 그걸 사는 편이 이득이라는 판단.
+ *   끄는 법 (예전 동작으로 복귀): 아래 두 곳의 주석을 풀면 된다. 다른 수정 불필요.
+ *     ① processLine() 안의 `// cleanBashInput(o, stats);`         — 메인 세션 Bash
+ *     ② cleanAgentProgress() 안의 주석 처리된 command 블록          — 서브에이전트 Bash
+ *   ※ 함수 cleanBashInput 자체는 지우지 않고 남겨둔다(호출만 끔) — 되살리기를 한 줄로 만들기 위해.
+ *     그래서 통계의 bashInputCount/Bytes는 이 상태에서 항상 0이다(정상).
+ *
+ * [결정: 파일 경로 보존] (2026-07-28, 주인님 지시)
+ *   Read/Edit/Write의 file_path 와 결과의 filePath 를 "자르지 않는다"(전체 경로 유지).
+ *   실측(같은 세션): 경로 관련 34곳 ≈ 2 KB — 전체의 0.05%. 감량 효과가 사실상 없다.
+ *   왜 살리나: 파일명만 남으면 같은 이름의 다른 파일을 구분할 수 없다.
+ *     실사례 — 이 맥에는 CLAUDE.md 가 최소 2개다:
+ *       /Users/…/project/CLAUDE.md  와  /Users/…/project/issue-00-ssh-19mbp/CLAUDE.md
+ *     둘 다 "CLAUDE.md"로 뭉개지면 어느 파일을 고쳤는지 복원이 불가능하다.
+ *     0.05%를 내고 그 구분을 사는 편이 압도적으로 이득.
+ *   부수 효과(오히려 개선): MCP 도구의 file_path 는 원래부터 안 잘렸다
+ *     (cleanInputFilepath가 name을 Read/Edit/Write로 한정하기 때문). 이제 일관성이 생긴다.
+ *   끄는 법 (예전 동작으로 복귀): 아래 5곳의 주석을 풀면 된다. 다른 수정 불필요.
+ *     ① processLine() 안의 `// cleanInputFilepath(o, stats);`  — 함수 전체가 경로 전용이라 호출만 끔
+ *     ②~⑤ 각 함수 안의 주석 처리된 filePath 블록 (함수 본업은 따로 있어 블록만 끔):
+ *          cleanAttachment / cleanReadResult / cleanWriteResult / cleanEditResult
+ *   ※ row.cwd 는 원래부터 손대지 않는다 — resume 명령의 cd 대상을 만드는 근거이기 때문.
  *
  * [지식: 기타 관찰]
  *   - v2.1.201 행에는 sessionId(camelCase) 외에 session_id(snake_case)가 따로 있다.
@@ -395,14 +437,16 @@ function cleanAttachment(o: Row, stats: CleaningStats, keepHookContent: boolean)
             cleaned = true;
           }
         }
-        if ("filePath" in fileObj && typeof fileObj.filePath === "string") {
-          const np = path.basename(fileObj.filePath);
-          if (fileObj.filePath !== np) {
-            stats.attachmentBytes += byteLen(fileObj.filePath) - byteLen(np);
-            fileObj.filePath = np;
-            cleaned = true;
-          }
-        }
+        // ★ [2026-07-28] 경로 보존 — 아래 블록 주석을 풀면 예전처럼 basename만 남긴다.
+        //   헤더 [결정: 파일 경로 보존] 참조. (attachment 안의 filePath)
+        // if ("filePath" in fileObj && typeof fileObj.filePath === "string") {
+        //   const np = path.basename(fileObj.filePath);
+        //   if (fileObj.filePath !== np) {
+        //     stats.attachmentBytes += byteLen(fileObj.filePath) - byteLen(np);
+        //     fileObj.filePath = np;
+        //     cleaned = true;
+        //   }
+        // }
       }
     }
     return cleaned;
@@ -420,14 +464,15 @@ function cleanReadResult(o: Row, stats: CleaningStats): boolean {
       fileObj.content = CLEANED_FILE_CONTENT;
       cleaned = true;
     }
-    if ("filePath" in fileObj && typeof fileObj.filePath === "string") {
-      const np = path.basename(fileObj.filePath);
-      if (fileObj.filePath !== np) {
-        stats.readBytes += byteLen(fileObj.filePath) - byteLen(np);
-        fileObj.filePath = np;
-        cleaned = true;
-      }
-    }
+    // ★ [2026-07-28] 경로 보존 — 아래 블록 주석을 풀면 복귀. 헤더 [결정: 파일 경로 보존] 참조.
+    // if ("filePath" in fileObj && typeof fileObj.filePath === "string") {
+    //   const np = path.basename(fileObj.filePath);
+    //   if (fileObj.filePath !== np) {
+    //     stats.readBytes += byteLen(fileObj.filePath) - byteLen(np);
+    //     fileObj.filePath = np;
+    //     cleaned = true;
+    //   }
+    // }
     return cleaned;
   } catch { return false; }
 }
@@ -464,14 +509,15 @@ function cleanWriteResult(o: Row, stats: CleaningStats): boolean {
         result.originalFile = CLEANED_WRITE_RESULT;
         cleaned = true;
       }
-      if ("filePath" in result && typeof result.filePath === "string") {
-        const np = path.basename(result.filePath);
-        if (result.filePath !== np) {
-          stats.writeResultBytes += byteLen(result.filePath) - byteLen(np);
-          result.filePath = np;
-          cleaned = true;
-        }
-      }
+      // ★ [2026-07-28] 경로 보존 — 아래 블록 주석을 풀면 복귀. 헤더 [결정: 파일 경로 보존] 참조.
+      // if ("filePath" in result && typeof result.filePath === "string") {
+      //   const np = path.basename(result.filePath);
+      //   if (result.filePath !== np) {
+      //     stats.writeResultBytes += byteLen(result.filePath) - byteLen(np);
+      //     result.filePath = np;
+      //     cleaned = true;
+      //   }
+      // }
       if (Array.isArray(result.structuredPatch)) {
         for (const patch of result.structuredPatch)
           if (patch && Array.isArray(patch.lines)) for (const line of patch.lines) if (line) stats.writeResultBytes += byteLen(line);
@@ -514,14 +560,15 @@ function cleanEditResult(o: Row, stats: CleaningStats): boolean {
           cleaned = true;
         }
       }
-      if ("filePath" in result && typeof result.filePath === "string") {
-        const np = path.basename(result.filePath);
-        if (result.filePath !== np) {
-          stats.editResultBytes += byteLen(result.filePath) - byteLen(np);
-          result.filePath = np;
-          cleaned = true;
-        }
-      }
+      // ★ [2026-07-28] 경로 보존 — 아래 블록 주석을 풀면 복귀. 헤더 [결정: 파일 경로 보존] 참조.
+      // if ("filePath" in result && typeof result.filePath === "string") {
+      //   const np = path.basename(result.filePath);
+      //   if (result.filePath !== np) {
+      //     stats.editResultBytes += byteLen(result.filePath) - byteLen(np);
+      //     result.filePath = np;
+      //     cleaned = true;
+      //   }
+      // }
       if (Array.isArray(result.structuredPatch)) {
         for (const patch of result.structuredPatch)
           if (patch && Array.isArray(patch.lines)) for (const line of patch.lines) if (line) stats.editResultBytes += byteLen(line);
@@ -735,12 +782,14 @@ function cleanAgentProgress(o: Row, stats: CleaningStats): boolean {
             }
           }
         }
-        const inp = item.input;
-        if (inp && typeof inp === "object" && typeof inp.command === "string" && inp.command && inp.command !== CLEANED_BASH_INPUT) {
-          stats.agentProgressBytes += byteLen(inp.command);
-          inp.command = CLEANED_BASH_INPUT;
-          cleaned = true;
-        }
+        // ★ [2026-07-28 결정] 서브에이전트의 bash command도 살려둔다 — 아래 블록 주석을 풀면 복귀.
+        //   메인(cleanBashInput)과 같은 이유. 파일 헤더 [결정: bash command 보존] 참조.
+        // const inp = item.input;
+        // if (inp && typeof inp === "object" && typeof inp.command === "string" && inp.command && inp.command !== CLEANED_BASH_INPUT) {
+        //   stats.agentProgressBytes += byteLen(inp.command);
+        //   inp.command = CLEANED_BASH_INPUT;
+        //   cleaned = true;
+        // }
         if (item.type === "text" && typeof item.text === "string" && item.text.length > 100 && !item.text.includes("[context-cleaner:")) {
           stats.agentProgressBytes += byteLen(item.text);
           item.text = CLEANED_AGENT_PROMPT;
@@ -987,7 +1036,9 @@ function processLine(o: Row, newSessionId: string, stats: CleaningStats, keepHoo
   cleanWriteResult(o, stats);
   cleanEditInput(o, stats);
   cleanEditResult(o, stats);
-  cleanBashInput(o, stats);
+  // ★ [2026-07-28 결정] bash command는 살려둔다 — 아래 한 줄 주석을 풀면 즉시 예전 동작으로 복귀.
+  //   이유·실측은 파일 헤더 [결정: bash command 보존] 참조. 출력(stdout/stderr)은 계속 지운다.
+  // cleanBashInput(o, stats);
   cleanBashResult(o, stats);
   cleanFilenamesResult(o, stats);
   cleanExitPlanModeInput(o, stats);
@@ -997,7 +1048,9 @@ function processLine(o: Row, newSessionId: string, stats: CleaningStats, keepHoo
   cleanTaskContentText(o, stats);
   cleanBashProgress(o, stats);
   cleanAgentProgress(o, stats);
-  cleanInputFilepath(o, stats);
+  // ★ [2026-07-28] 경로 보존 — 아래 한 줄 주석을 풀면 예전처럼 basename만 남긴다.
+  //   이 함수는 file_path 자르기'만' 하므로 호출만 끄면 된다. 헤더 [결정: 파일 경로 보존] 참조.
+  // cleanInputFilepath(o, stats);
   cleanBashTags(o, stats);
   cleanUserMarked(o, stats);
   cleanMetaContent(o, stats);
@@ -1226,7 +1279,7 @@ export function verifyAgainstBaseline(inputLines: string[], outputLines: string[
   //   roots===0은 잡지 않는다: 클리너는 user/assistant 대화 행을 삭제하지 않으므로(설계 불변)
   //   "대화 통째 소멸"은 구조적으로 불가능하다. --hooks keep 계열에선 첫 user의 parent가 살아있는
   //   훅 attachment라 정상임에도(F_기각) "대화타입 + parentUuid null"인 root가 0개로 세이는
-  //   케이스가 있어, ===0 판정은 정상 파일을 오잡하는 역할만 한다 (regression transcript의 keep/sessionstart에서 실측).
+  //   케이스가 있어, ===0 판정은 정상 파일을 오잡하는 역할만 한다 (안됨본 keep/sessionstart 실측).
   if (output.conversationRootCount > 1)
     problems.push(`다중 root ${output.conversationRootCount}개 (파편 root 발생)`);
   // §5.3 resume 앵커(마지막 last-prompt.leafUuid) — CC가 실제로 열 갈래의 건강도
@@ -1319,7 +1372,7 @@ export function lastCwd(rows: ReadonlyArray<{ o: Record<string, any> | null }>):
  * 실행하는 터미널의 셸이 그 자리에서 자기 홈으로 확장하므로, 어느 머신·어느 사용자명에서
  * 붙여넣어도 통한다 (기록된 cwd는 기록 당시 머신의 절대경로이므로).
  *  - 현재 홈으로 시작하면 그대로 토큰화.
- *  - 다른 계정의 홈 경로이면 "현재 홈 기준으로 실존할 때만" 토큰화 —
+ *  - 다른 홈(/Users/<이름>/…, /home/<이름>/…)이면 "현재 홈 기준으로 실존할 때만" 토큰화 —
  *    진짜 다른 계정의 경로를 엉뚱한 곳으로 틀어버리는 오치환 방지.
  *    실존 안 하면 원문 유지(cd 실패가 눈에 보이도록).
  *  - 주의: ${HOME}은 홑따옴표 안에서 확장되지 않는다 — 인용은 buildResumeCommand가

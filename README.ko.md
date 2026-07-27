@@ -44,12 +44,25 @@ After all steps, tell me to restart the session.
 
 ## 기능
 
+**원칙: 결과는 지우고, 재현 수단은 남긴다.**
+결과는 대화 안의 요약으로 대체되지만, 명령어와 경로는 요약으로 복원되지 않기 때문입니다.
+
 `.jsonl` transcript 파일에서 불필요한 데이터를 제거합니다:
-- thinking-only 행, 파일 내용, diff, stdout/stderr
-- 전체 파일 경로 → 파일명만 유지
+- thinking-only 행, 파일 내용, diff, stdout/stderr, base64 이미지
 - hook progress·hook summary·hook attachment, synthetic/local-command 행, tool result 중복 데이터, meta content
 
-보존 항목: 대화 텍스트, 편집 의도, 파일명, UUID 체인, resume anchor, 갈래 tip
+보존 항목: 대화 텍스트, 편집 의도, UUID 체인, resume anchor, 갈래 tip,
+**bash command 전문**, **파일 전체 경로**
+
+> **2026-07 변경 — 명령어와 경로를 이제 보존합니다.**
+> 이전에는 `input.command`를 치환하고 전체 경로를 파일명으로 잘랐습니다.
+> 실측 (실제 4.2 MB / 1,526행 transcript 기준):
+> bash command는 **1.70%** (167개, 약 20,600 토큰), 경로는 **0.05%** (약 2 KB)를 차지합니다.
+> 반면 계속 지우는 bash **출력**은 명령어의 **2.8배**입니다.
+> 감량률은 양쪽 모두 **68.8%** 로 동일 — 남겨도 사실상 공짜입니다.
+> 파일명만 남기면 같은 이름의 다른 파일을 구분할 수 없고(예: 서로 다른 `CLAUDE.md` 두 개),
+> 명령어 안의 옵션·정규식·필드 오프셋 시행착오는 요약으로 복원되지 않습니다.
+> 두 동작 모두 **주석 한 줄**로 되돌릴 수 있습니다 — [되돌리기](#되돌리기-보존-vs-제거) 참조.
 
 ### 동작 원리
 
@@ -82,7 +95,7 @@ thinking-only assistant 행은 삭제하고 참조를 다시 연결합니다. th
 
 파일을 읽으면 파일 전체 내용이 트랜스크립트에 기록됩니다.
 
-- **호출**: `input.file_path` → 파일명만 남김
+- **호출**: `input.file_path` → **보존 (전체 경로)**
 - **실행 결과**: `toolUseResult.file.content` → 치환
 - **결과 중복**: `tool_result.content` → 치환
 
@@ -90,7 +103,7 @@ thinking-only assistant 행은 삭제하고 참조를 다시 연결합니다. th
 
 파일을 작성하면 작성 내용과 원본 파일이 기록됩니다.
 
-- **호출**: `input.file_path` → 파일명만 남김, `input.content` → 치환
+- **호출**: `input.file_path` → **보존 (전체 경로)**, `input.content` → 치환
 - **실행 결과**: `toolUseResult.content`, `.originalFile`, `.structuredPatch` → 치환
 - **결과 중복**: `tool_result.content` → 치환
 
@@ -98,7 +111,7 @@ thinking-only assistant 행은 삭제하고 참조를 다시 연결합니다. th
 
 파일을 편집하면 변경 전/후 문자열과 원본 파일이 기록됩니다.
 
-- **호출**: `input.file_path` → 파일명만 남김, `input.old_string`, `input.new_string` → 치환
+- **호출**: `input.file_path` → **보존 (전체 경로)**, `input.old_string`, `input.new_string` → 치환
 - **실행 결과**: `toolUseResult.oldString`, `.newString`, `.originalFile`, `.structuredPatch` → 치환
 - **결과 중복**: `tool_result.content` → 치환
 
@@ -106,7 +119,7 @@ thinking-only assistant 행은 삭제하고 참조를 다시 연결합니다. th
 
 명령을 실행하면 명령어와 전체 출력이 기록됩니다.
 
-- **호출**: `input.command` → 치환
+- **호출**: `input.command` → **보존 (전문)**
 - **실행 결과**: `toolUseResult.stdout`, `.stderr` → 치환
 - **진행 로그**: `data.output`, `data.fullOutput` (bash_progress 행) → 치환
 - **결과 중복**: `tool_result.content` → 치환
@@ -174,6 +187,36 @@ URL을 가져오면 페이지 전체 내용이 기록됩니다.
    cd ${HOME}/project/example && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume <session-id>
 🔎 Verification: PASS
 ```
+
+### 되돌리기: 보존 vs 제거
+
+bash command와 전체 경로를 보존하는 것은 **기본값이지 고정 규칙이 아닙니다.**
+각 동작은 `scripts/context-cleaner.ts`의 주석 블록으로 꺼져 있으므로, 주석을 풀면 다시 제거합니다.
+다른 수정은 필요 없습니다.
+
+**bash command를 제거하려면** (2곳 주석 해제):
+
+| 위치 | 대상 |
+|---|---|
+| `processLine()` | `// cleanBashInput(o, stats);` |
+| `cleanAgentProgress()` | 주석 처리된 `input.command` 블록 (서브에이전트 bash) |
+
+**파일 전체 경로를 제거하려면** (5곳 주석 해제):
+
+| 위치 | 대상 |
+|---|---|
+| `processLine()` | `// cleanInputFilepath(o, stats);` — 이 함수는 경로 전용이라 호출만 켜면 됨 |
+| `cleanAttachment()` | 주석 처리된 `filePath` 블록 |
+| `cleanReadResult()` | 주석 처리된 `filePath` 블록 |
+| `cleanWriteResult()` | 주석 처리된 `filePath` 블록 |
+| `cleanEditResult()` | 주석 처리된 `filePath` 블록 |
+
+참고:
+- `cleanBashInput()`과 `cleanInputFilepath()` 함수 자체는 **소스에 남겨뒀습니다** (호출만 껐습니다).
+  되돌리기를 한 줄 수정으로 만들기 위해서입니다. 그래서 이 설정에서는 통계의 `Bash inputs`와
+  `Filenames` 값이 항상 `0`입니다 — 정상이며 버그가 아닙니다.
+- `row.cwd`는 원래부터 손대지 않습니다. resume 명령의 `cd` 대상을 만드는 근거이기 때문입니다.
+- 시스템 프롬프트는 transcript에 **기록되지 않습니다**. 제거할 대상 자체가 없습니다.
 
 ## 사용법
 
