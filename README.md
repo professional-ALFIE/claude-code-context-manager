@@ -44,12 +44,25 @@ After all steps, tell me to restart the session.
 
 ## What it does
 
+**Principle: strip the results, keep the means to reproduce them.**
+Results are recoverable from your own summaries in the conversation; commands and paths are not.
+
 Strips bulky data from `.jsonl` transcript files:
-- Thinking-only rows, file contents, diffs, stdout/stderr
-- Full file paths → filenames only
+- Thinking-only rows, file contents, diffs, stdout/stderr, base64 images
 - Hook progress, hook summaries and hook attachments; synthetic/local-command rows; tool result duplicates; meta content
 
-Preserves: conversation text, edit intent, filenames, UUID chains, resume anchors, and branch tips.
+Preserves: conversation text, edit intent, UUID chains, resume anchors, branch tips,
+**bash commands (verbatim)**, and **full file paths**.
+
+> **Changed in 2026-07 — commands and paths are now kept.**
+> Previously `input.command` was replaced and full paths were trimmed to filenames.
+> Measured on a real 4.2 MB / 1,526-row transcript:
+> bash commands cost **1.70%** (167 items, ~20.6k tokens) and paths **0.05%** (~2 KB),
+> while bash *output* — still stripped — is **2.8×** the size of the commands.
+> Reduction stayed at **68.8%** either way, so keeping them is nearly free.
+> Filenames alone cannot disambiguate same-named files (e.g. two different `CLAUDE.md`),
+> and option/regex/field-offset trial-and-error inside a command is not recoverable from a summary.
+> Both behaviours are **one comment away** from returning — see [Reverting](#reverting-keep-vs-strip).
 
 ### How it works
 
@@ -82,7 +95,7 @@ Thinking-only assistant rows are deleted and their references are remapped. If a
 
 Reading a file records its full content in the transcript.
 
-- **Call**: `input.file_path` → trimmed to filename only
+- **Call**: `input.file_path` → **kept (full path)**
 - **Result**: `toolUseResult.file.content` → replaced
 - **Result duplicate**: `tool_result.content` → replaced
 
@@ -90,7 +103,7 @@ Reading a file records its full content in the transcript.
 
 Writing a file records the written content and the original file.
 
-- **Call**: `input.file_path` → trimmed to filename only, `input.content` → replaced
+- **Call**: `input.file_path` → **kept (full path)**, `input.content` → replaced
 - **Result**: `toolUseResult.content`, `.originalFile`, `.structuredPatch` → replaced
 - **Result duplicate**: `tool_result.content` → replaced
 
@@ -98,7 +111,7 @@ Writing a file records the written content and the original file.
 
 Editing records old/new strings and the original file.
 
-- **Call**: `input.file_path` → trimmed to filename only, `input.old_string`, `input.new_string` → replaced
+- **Call**: `input.file_path` → **kept (full path)**, `input.old_string`, `input.new_string` → replaced
 - **Result**: `toolUseResult.oldString`, `.newString`, `.originalFile`, `.structuredPatch` → replaced
 - **Result duplicate**: `tool_result.content` → replaced
 
@@ -106,7 +119,7 @@ Editing records old/new strings and the original file.
 
 Running a command records the command text and its full output.
 
-- **Call**: `input.command` → replaced
+- **Call**: `input.command` → **kept (verbatim)**
 - **Result**: `toolUseResult.stdout`, `.stderr` → replaced
 - **Progress**: `data.output`, `data.fullOutput` (bash_progress lines) → replaced
 - **Result duplicate**: `tool_result.content` → replaced
@@ -174,6 +187,36 @@ After cleaning, you get a detailed report:
    cd ${HOME}/project/example && claude --dangerously-skip-permissions --thinking-display summarized --verbose --resume <session-id>
 🔎 Verification: PASS
 ```
+
+### Reverting: keep vs strip
+
+Keeping bash commands and full paths is a **default, not a hard rule**. Each behaviour is
+disabled by a comment block in `scripts/context-cleaner.ts` — uncomment to strip them again.
+No other edits are needed.
+
+**To strip bash commands** (uncomment 2 places):
+
+| Location | Line |
+|---|---|
+| `processLine()` | `// cleanBashInput(o, stats);` |
+| `cleanAgentProgress()` | the commented `input.command` block (subagent bash) |
+
+**To strip full file paths** (uncomment 5 places):
+
+| Location | What |
+|---|---|
+| `processLine()` | `// cleanInputFilepath(o, stats);` — whole function is path-only, so disabling the call is enough |
+| `cleanAttachment()` | commented `filePath` block |
+| `cleanReadResult()` | commented `filePath` block |
+| `cleanWriteResult()` | commented `filePath` block |
+| `cleanEditResult()` | commented `filePath` block |
+
+Notes:
+- `cleanBashInput()` and `cleanInputFilepath()` are **kept in the source** (only their calls are
+  disabled) so that reverting is a one-line change. Consequently the `Bash inputs` and `Filenames`
+  counters read `0` in this configuration — that is expected, not a bug.
+- `row.cwd` was never touched; it is the source for the `cd` target in the resume command.
+- System prompts are **not** recorded in the transcript at all, so there is nothing to strip there.
 
 ## Usage
 
