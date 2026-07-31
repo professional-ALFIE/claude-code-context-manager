@@ -141,6 +141,8 @@ const CLEANED_TOOL_RESULT_STRING = "[context-cleaner: tool_result_string]";
 const CLEANED_TEAMMATE_MESSAGE = "[context-cleaner: teammate_message]";
 const CLEANED_ATTACHMENT = "[context-cleaner: attachment]";
 const CLEANED_META_CONTENT = "[context-cleaner: meta]";
+const CLEANED_WORKFLOW_SCRIPT = "[context-cleaner: workflow_script]";
+const CLEANED_ATTACHMENT_SNIPPET = "[context-cleaner: snippet]";
 
 // 정규식 (python re.DOTALL → [\s\S])
 const BASH_TAGS_PATTERN =
@@ -223,6 +225,7 @@ class CleaningStats {
   localCommandStdoutCount = 0; localCommandStdoutBytes = 0;
   toolUseInputPromptCount = 0; toolUseInputPromptBytes = 0;
   attachmentCount = 0; attachmentBytes = 0;
+  workflowScriptCount = 0; workflowScriptBytes = 0;
   // ── v4 계승 (행 삭제) ──
   localCmdRowsDeleted = 0;
   // ── v5 신규 (행 삭제) ──
@@ -246,6 +249,7 @@ class CleaningStats {
       this.userMarkedBytes + this.taskOutputBytes + this.bashProgressBytes + this.metaContentBytes +
       this.localCmdOutputBytes + this.agentProgressBytes + this.taskContentTextBytes +
       this.base64ImageBytes + this.toolResultStringBytes + this.teammateMessageBytes +
+      this.workflowScriptBytes +
       this.toolUseResultPromptBytes + this.localCommandStdoutBytes + this.toolUseInputPromptBytes +
       this.attachmentBytes
     );
@@ -284,6 +288,7 @@ class CleaningStats {
     L("Local cmd stdout:", this.localCommandStdoutCount, this.localCommandStdoutBytes);
     L("ToolUse inp prompt:", this.toolUseInputPromptCount, this.toolUseInputPromptBytes);
     L("Attachments:", this.attachmentCount, this.attachmentBytes);
+    L("Workflow scripts:", this.workflowScriptCount, this.workflowScriptBytes);
     console.log(`\n🗑  Row Deletions (행 삭제 + 재매핑):`);
     console.log(`  Thinking rows:       ${String(this.thinkingRowsDeleted).padStart(4)} deleted (${this.thinkingRowsBytes.toLocaleString()} bytes)`);
     console.log(`  Hook rows:           ${String(this.hookRowsDeleted).padStart(4)} deleted (${this.hookRowsBytes.toLocaleString()} bytes)`);
@@ -376,6 +381,17 @@ function cleanAttachment(o: Row, stats: CleaningStats, keepHookContent: boolean)
     if (keepHookContent && typeof attachment.type === "string" && attachment.type.startsWith("hook_")) return false;
     const content = attachment.content;
     let cleaned = false;
+    // 외부에서 파일이 바뀐 것을 알리는 첨부(type="edited_text_file")는 본문을
+    // content가 아니라 snippet에 담는다 → v4 규칙이 이 자리를 지나쳤다.
+    // 실측(2026-07-31): 8행 57,128B가 남아 컨텍스트 Messages를 14.6k 더 먹고 있었다
+    // (제거 후 80.4k→65.8k). 대상 파일은 디스크에 실물로 있고 filename이 남으므로
+    // 유일본이 아니다. 행은 uuid를 갖고 자식이 매달려 있어 삭제하지 않고 값만 치환한다.
+    if (typeof attachment.snippet === "string" && attachment.snippet && attachment.snippet !== CLEANED_ATTACHMENT_SNIPPET) {
+      stats.attachmentCount++;
+      stats.attachmentBytes += byteLen(attachment.snippet);
+      attachment.snippet = CLEANED_ATTACHMENT_SNIPPET;
+      cleaned = true;
+    }
     if (typeof content === "string") {
       if (content && content !== CLEANED_ATTACHMENT) {
         stats.attachmentCount++;
@@ -414,6 +430,16 @@ function cleanReadResult(o: Row, stats: CleaningStats): boolean {
     const fileObj = o?.toolUseResult?.file;
     if (!fileObj || typeof fileObj !== "object") return false;
     let cleaned = false;
+    // 도구가 반환한 이미지의 두 번째 사본. 같은 이미지가 message.content 쪽
+    // tool_result 안에도 들어 있어 두 자리를 함께 지워야 실효가 있다.
+    // 치환값은 반드시 유효한 1x1 PNG — API가 이 값을 디코딩하므로 깨진 값은 400을 낸다.
+    // originalSize·dimensions·type 같은 메타는 건드리지 않는다(content 필드와 동일 원칙).
+    if ("base64" in fileObj && typeof fileObj.base64 === "string" && fileObj.base64 !== CLEANED_BASE64_IMAGE) {
+      stats.base64ImageCount++;
+      stats.base64ImageBytes += byteLen(fileObj.base64);
+      fileObj.base64 = CLEANED_BASE64_IMAGE;
+      cleaned = true;
+    }
     if ("content" in fileObj && fileObj.content && fileObj.content !== CLEANED_FILE_CONTENT) {
       stats.readCount++;
       stats.readBytes += byteLen(fileObj.content);
@@ -859,26 +885,42 @@ function cleanMetaContent(o: Row, stats: CleaningStats): boolean {
   } catch { return false; }
 }
 
+/** image 블록 하나의 source.data를 1x1 PNG로 치환. (v4 계승 규칙을 함수로 분리) */
+function cleanImageBlock(item: any, stats: CleaningStats): boolean {
+  if (!item || typeof item !== "object" || item.type !== "image") return false;
+  const source = item.source;
+  if (!source || typeof source !== "object" || !("data" in source)) return false;
+  let cleaned = false;
+  if (source.data && source.data !== CLEANED_BASE64_IMAGE) {
+    stats.base64ImageBytes += byteLen(source.data);
+    source.data = CLEANED_BASE64_IMAGE;
+    stats.base64ImageCount++;
+    cleaned = true;
+  }
+  if (source.media_type !== "image/png") {
+    source.media_type = "image/png"; // placeholder가 png라서 media_type도 맞춤 (v4 계승)
+    cleaned = true;
+  }
+  return cleaned;
+}
+
+/** base64 이미지 치환. 이미지가 놓이는 자리는 두 가지다:
+ *    ① 붙여넣은 이미지 → message.content[]에 image 블록이 바로 놓인다 (v4가 알던 형태)
+ *    ② 도구가 반환한 이미지 → message.content[] → tool_result.content[] 안쪽에 놓인다
+ *  ②는 최상위에서 보면 type이 "tool_result"라 v4 규칙이 껍데기를 못 뚫고 지나쳤다.
+ *  실측(2026-07-31): 스크린샷 2장이 정리 후에도 남아 파일의 32%를 차지했고
+ *  리포트에는 "Base64 images: 0 cleaned"로 찍혔다. 같은 이미지의 두 번째 사본은
+ *  toolUseResult.file.base64에 있어 cleanReadResult가 함께 치운다. */
 function cleanBase64Images(o: Row, stats: CleaningStats): boolean {
   try {
     const content = o?.message?.content;
     if (!Array.isArray(content)) return false;
     let cleaned = false;
     for (const item of content) {
-      if (item && typeof item === "object" && item.type === "image") {
-        const source = item.source;
-        if (source && typeof source === "object" && "data" in source) {
-          if (source.data && source.data !== CLEANED_BASE64_IMAGE) {
-            stats.base64ImageBytes += byteLen(source.data);
-            source.data = CLEANED_BASE64_IMAGE;
-            stats.base64ImageCount++;
-            cleaned = true;
-          }
-          if (source.media_type !== "image/png") {
-            source.media_type = "image/png"; // placeholder가 png라서 media_type도 맞춤 (v4 계승)
-            cleaned = true;
-          }
-        }
+      if (cleanImageBlock(item, stats)) cleaned = true;
+      // tool_result 한 겹 안쪽 (중첩은 이 한 단계만 실측됨 — 더 깊은 재귀는 넣지 않는다)
+      if (item?.type === "tool_result" && Array.isArray(item.content)) {
+        for (const inner of item.content) if (cleanImageBlock(inner, stats)) cleaned = true;
       }
     }
     return cleaned;
@@ -949,6 +991,29 @@ function cleanToolUseInputPrompt(o: Row, stats: CleaningStats): boolean {
   } catch { return false; }
 }
 
+/** Workflow 도구의 인라인 스크립트 전문(input.script, 최대 512KB) 치환.
+ *  실행 결과는 완료 알림(task-notification)에 남고, 스크립트 파일은 세션 폴더에 보존되므로
+ *  transcript에 전문을 다시 들고 갈 이유가 없다. 색인인 name·scriptPath는 손대지 않는다. */
+function cleanWorkflowScript(o: Row, stats: CleaningStats): boolean {
+  try {
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) return false;
+    let cleaned = false;
+    for (const item of content) {
+      if (!item || typeof item !== "object" || item.type !== "tool_use" || item.name !== "Workflow") continue;
+      const inp = item.input;
+      if (!inp || typeof inp !== "object") continue;
+      const s = inp.script;
+      if (typeof s !== "string" || s.length <= 100 || s.includes("[context-cleaner:")) continue;
+      stats.workflowScriptBytes += byteLen(s);
+      stats.workflowScriptCount++;
+      inp.script = CLEANED_WORKFLOW_SCRIPT;
+      cleaned = true;
+    }
+    return cleaned;
+  } catch { return false; }
+}
+
 function cleanLocalCommandStdout(o: Row, stats: CleaningStats): boolean {
   try {
     if (o?.type !== "user") return false;
@@ -1007,6 +1072,7 @@ function processLine(o: Row, newSessionId: string, stats: CleaningStats, keepHoo
   cleanToolUseResultPrompt(o, stats);
   cleanLocalCommandStdout(o, stats);
   cleanToolUseInputPrompt(o, stats);
+  cleanWorkflowScript(o, stats);
 }
 
 // ============================================================================
@@ -1073,6 +1139,22 @@ function isSyntheticRow(o: Row): boolean {
     return true;
   return false;
 }
+
+/* [지식: queue-operation 행 — 조사했으나 "삭제하지 않는다"로 결정됨 (2026-07-31)]
+ *   비동기 알림이나 사용자 입력이 응답 생성 중에 도착해 큐에 쌓였다(enqueue) 꺼내진
+ *   (dequeue/remove) 타이밍 기록. Workflow·Monitor·백그라운드 Bash를 쓰면 생긴다.
+ *
+ *   실측 (Workflow 2회 쓴 세션 440행): 20행 9,285바이트.
+ *     - uuid·parentUuid가 없어 체인에 참여하지 않는다 → 지워도 재매핑할 것이 없다.
+ *     - dequeue 7건은 content 필드조차 없다 (138B).
+ *     - content를 가진 13건은 전부 다른 행과 중복: 알림 5건은 같은 본문이
+ *       origin.kind="task-notification" user 행에, 사용자 발화 2건은
+ *       origin.kind="human" user 행에 존재(대조 확인). enqueue·remove는 쌍으로 중복.
+ *
+ *   즉 "지워도 안전하고 내용도 중복"이지만, 입력이 언제 도달해 언제 소비됐는지의
+ *   타이밍은 이 행에만 남는다. 그 기록을 남기는 편을 택했다 → 삭제 규칙을 넣지 않는다.
+ *   (다시 논의할 때 이 실측을 재조사하지 말 것. 결정만 바꾸면 된다.)
+ */
 
 // ============================================================================
 // 무결성 분석 (fix-session의 analyze 차용·개선판)

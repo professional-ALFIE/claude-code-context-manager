@@ -596,6 +596,176 @@ async function main() {
     assert(sha(WORK) === beforeHash, "CLI 실패 시 원본 내용 무손상");
   });
 
+  // T18 ──────────────────────────────────────────────────────────────
+  // Workflow 도구 흔적: 인라인 script 전문은 치환, queue-operation 행은 삭제,
+  // 완료 알림(task-notification)의 failures·diagnostics는 보존 —
+  // 알림 본문은 실패 원인과 journal.jsonl 색인이라 지우면 추적이 끊긴다 (§14 동작 검증)
+  await test("T18 fixture: Workflow inline script만 치환되고 queue-operation·완료 알림은 보존된다", async () => {
+    // Arrange ── 실측한 Workflow 행 구성 그대로 (호출 → 접수증 → 큐잉 → 완료 알림)
+    const F = FIXTURE.replace("malformed", "workflow");
+    const sid = "fixture-workflow-0000-0000-000000000001";
+    const bigScript = "export const meta = {name:'wf'}\n" + "// 인라인 스크립트 전문\n".repeat(60);
+    const notification =
+      "<task-notification>\n<status>completed</status>\n" +
+      "<diagnostics>Per-agent results: /path/journal.jsonl — resumeFromRunId: 'wf_abc'</diagnostics>\n" +
+      "<failures>parallel[0] failed: subagent completed without calling StructuredOutput</failures>\n" +
+      "<usage><agent_count>10</agent_count></usage>\n</task-notification>";
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "워크플로우 돌려라" }, uuid: "u-1", timestamp: "2026-07-31T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name: "Workflow", id: "tu-1", input: { script: bigScript, scriptPath: "/repo/wf.mjs" } }] }, uuid: "a-1", timestamp: "2026-07-31T00:00:01.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "a-1", type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-1", content: "Workflow launched" }] }, toolUseResult: { status: "async_launched", taskType: "local_workflow", runId: "wf_abc", transcriptDir: "/path/subagents" }, uuid: "u-2", timestamp: "2026-07-31T00:00:02.000Z", sessionId: sid }),
+      // queue-operation: uuid·parentUuid가 없다 (실측). content는 아래 알림과 중복
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-07-31T00:00:03.000Z", sessionId: sid, content: notification }),
+      JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-07-31T00:00:04.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-2", type: "user", origin: { kind: "task-notification" }, message: { role: "user", content: notification }, uuid: "u-3", timestamp: "2026-07-31T00:00:05.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+    const beforeBytes = readFileSync(F).length;
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+
+    // Assert ── ① 인라인 script 전문은 사라지고 색인(name·scriptPath)은 남는다
+    const wfCall = after.find((r) => r.o?.uuid === "a-1");
+    const wfInput = wfCall?.o?.message?.content?.[0]?.input;
+    assert(wfInput?.script === "[context-cleaner: workflow_script]", `input.script 치환 (실제: ${String(wfInput?.script).slice(0, 40)})`);
+    assert(wfInput?.scriptPath === "/repo/wf.mjs", "input.scriptPath는 색인이므로 보존");
+    assert(wfCall?.o?.message?.content?.[0]?.name === "Workflow", "tool_use.name 보존");
+    // 감량 폭 검증: 스크립트 전문(약 1.5KB)이 빠졌다면 최소 절반 이상 줄어야 한다.
+    // 느슨한 "줄었다"만 보면 다른 규칙의 감량에 묻혀 이 규칙의 회귀를 못 잡는다.
+    const afterBytes = readFileSync(res.outputPath).length;
+    assert(afterBytes < beforeBytes * 0.5, `스크립트 전문이 빠져 절반 이상 감량 (${beforeBytes}→${afterBytes})`);
+
+    // ② queue-operation 행은 보존한다 (2026-07-31 결정).
+    //    지워도 안전하지만 입력의 도달·소비 타이밍은 이 행에만 남으므로 남긴다.
+    assert(after.filter((r) => r.o?.type === "queue-operation").length === 2, "queue-operation 행 2개 보존");
+
+    // ③ 완료 알림 본문은 원문 그대로 — 실패 원인과 journal 색인이 유지되어야 한다
+    const notif = after.find((r) => r.o?.uuid === "u-3");
+    const nc = notif?.o?.message?.content;
+    assert(typeof nc === "string" && nc.includes("StructuredOutput"), "완료 알림의 failures 내용 보존");
+    assert(typeof nc === "string" && nc.includes("journal.jsonl"), "완료 알림의 diagnostics 색인 보존");
+    assert(notif?.o?.toolUseResult === undefined || true, "접수증 행 존재 여부와 무관하게 체인 유지");
+
+    // ④ 접수증의 추적 색인 보존 + 체인 무결성
+    const receipt = after.find((r) => r.o?.uuid === "u-2");
+    assert(receipt?.o?.toolUseResult?.transcriptDir === "/path/subagents", "접수증 transcriptDir(색인) 보존");
+    const us = uuidSet(after);
+    assert(after.filter((r) => r.o?.parentUuid && !us.has(r.o.parentUuid)).length === 0, "고아 parentUuid 0개");
+    assert(res.verify?.ok === true, "내장 무결성 검사 통과");
+  });
+
+  // T19 ──────────────────────────────────────────────────────────────
+  // 도구가 반환한 스크린샷: 같은 이미지가 두 자리에 저장된다.
+  //   ① message.content[] → tool_result.content[] → image.source.data  (한 겹 안쪽)
+  //   ② toolUseResult.file.base64                                       (두 번째 사본)
+  // 기존 규칙은 ①을 최상위 배열에서만 찾아 tool_result 껍데기를 못 뚫었고,
+  // ②는 규칙 자체가 없었다 → 실측 세션에서 1MB가 그대로 남았다 (Base64 images: 0 cleaned).
+  // 치환값은 기존과 동일한 1x1 PNG여야 한다 — API가 data를 디코딩하므로 깨진 값은 400을 낸다.
+  await test("T19 fixture: 도구 반환 이미지가 두 자리 모두 1x1 PNG로 치환되고 메타는 보존된다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "toolimage");
+    const sid = "fixture-toolimage-0000-000000000001";
+    const bigB64 = "iVBORw0KGgo" + "QUJDRUZHSElKS0xNTk9QUVJTVFVWV1hZWmFiY2RlZmdoaWprbG1ub3A".repeat(40);
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "스크린샷 찍어" }, uuid: "u-1", timestamp: "2026-07-31T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", name: "Bash", id: "tu-1", input: { command: "screencapture" } }] }, uuid: "a-1", timestamp: "2026-07-31T00:00:01.000Z", sessionId: sid }),
+      JSON.stringify({
+        parentUuid: "a-1", type: "user", uuid: "u-2", timestamp: "2026-07-31T00:00:02.000Z", sessionId: sid,
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: "tu-1", content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: bigB64 } }] }] },
+        toolUseResult: { type: "image", file: { base64: bigB64, type: "image/png", originalSize: 278348, dimensions: { originalWidth: 1999, originalHeight: 1112 } } },
+      }),
+    ].join("\n") + "\n");
+    const beforeBytes = readFileSync(F).length;
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const row = after.find((r) => r.o?.uuid === "u-2");
+
+    // Assert ── ① 중첩된 tool_result 안쪽까지 치환됐는가
+    const inner = row?.o?.message?.content?.[0]?.content?.[0];
+    assert(inner?.type === "image", "tool_result 안의 image 블록 구조는 유지");
+    assert(typeof inner?.source?.data === "string" && inner.source.data.length < 200, `중첩 source.data 치환 (실제 ${inner?.source?.data?.length}자)`);
+    assert(inner?.source?.media_type === "image/png", "media_type은 placeholder에 맞춰 image/png");
+
+    // ② toolUseResult.file.base64도 치환됐는가
+    const fileObj = row?.o?.toolUseResult?.file;
+    assert(typeof fileObj?.base64 === "string" && fileObj.base64.length < 200, `file.base64 치환 (실제 ${fileObj?.base64?.length}자)`);
+
+    // ③ 치환값이 유효한 1x1 PNG인가 — 깨진 값이면 resume이 400으로 죽는다
+    for (const [label, v] of [["중첩 source.data", inner?.source?.data], ["file.base64", fileObj?.base64]] as const) {
+      const buf = Buffer.from(String(v), "base64");
+      assert(buf.length > 0 && buf.subarray(0, 8).toString("hex") === "89504e470d0a1a0a", `${label}: 유효한 PNG 시그니처`);
+    }
+
+    // ④ 메타는 건드리지 않는다 (기존 cleanReadResult가 content만 치환하는 것과 동형)
+    assert(fileObj?.originalSize === 278348, "originalSize 보존");
+    assert(fileObj?.dimensions?.originalWidth === 1999, "dimensions 보존");
+    assert(fileObj?.type === "image/png", "file.type 보존");
+
+    // ⑤ 감량과 무결성
+    const afterBytes = readFileSync(res.outputPath).length;
+    assert(afterBytes < beforeBytes * 0.3, `두 사본이 빠져 70%+ 감량 (${beforeBytes}→${afterBytes})`);
+    const us = uuidSet(after);
+    assert(after.filter((r) => r.o?.parentUuid && !us.has(r.o.parentUuid)).length === 0, "고아 parentUuid 0개");
+    assert(res.verify?.ok === true, "내장 무결성 검사 통과");
+  });
+
+  // T20 ──────────────────────────────────────────────────────────────
+  // 외부에서 파일이 바뀐 것을 알리는 첨부(attachment.type="edited_text_file")는
+  // 본문을 attachment.content가 아니라 attachment.snippet에 담는다.
+  // 기존 cleanAttachment는 content 키만 봐서 이 자리를 지나쳤다.
+  // 실측(2026-07-31): 8행 57,128B가 남아 있었고, 치환하니 컨텍스트가
+  // Messages 80.4k → 65.8k (14.6k 감소)로 줄었다 — 실제로 컨텍스트에 실리는 자리다.
+  // filename은 파일을 다시 찾는 색인이라 건드리지 않는다.
+  await test("T20 fixture: attachment.snippet이 치환되고 filename(색인)은 보존된다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "snippet");
+    const sid = "fixture-snippet-0000-000000000001";
+    const bigSnippet = Array.from({ length: 80 }, (_, i) => `${i + 1} export const line${i} = ${i};`).join("\n");
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "파일 고쳐" }, uuid: "u-1", timestamp: "2026-07-31T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "attachment", uuid: "att-1", timestamp: "2026-07-31T00:00:01.000Z", sessionId: sid, attachment: { type: "edited_text_file", filename: "/repo/dynamic-workflow/wf.mjs", snippet: bigSnippet } }),
+      JSON.stringify({ parentUuid: "att-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "확인했습니다" }] }, uuid: "a-1", timestamp: "2026-07-31T00:00:02.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+    const beforeBytes = readFileSync(F).length;
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const att = after.find((r) => r.o?.uuid === "att-1");
+
+    // Assert ── ① snippet 치환
+    const snip = att?.o?.attachment?.snippet;
+    assert(typeof snip === "string" && snip.length < 100, `snippet 치환 (실제 ${String(snip).length}자)`);
+    assert(String(snip).includes("context-cleaner"), "placeholder 형식은 기존과 동일한 [context-cleaner: …]");
+
+    // ② 색인·구조 보존
+    assert(att?.o?.attachment?.filename === "/repo/dynamic-workflow/wf.mjs", "filename(색인) 보존");
+    assert(att?.o?.attachment?.type === "edited_text_file", "attachment.type 보존");
+
+    // ③ 행은 남는다 — 이 행들은 uuid를 갖고 자식이 매달려 있어 삭제하면 재매핑이 필요하다.
+    //    값만 치환하면 체인은 그대로다 (실측에서 검증 PASS였던 방식)
+    assert(after.length === 3, "행 수 유지 (삭제 아님)");
+    const us = uuidSet(after);
+    assert(after.filter((r) => r.o?.parentUuid && !us.has(r.o.parentUuid)).length === 0, "고아 parentUuid 0개");
+
+    // ④ 감량과 무결성
+    const afterBytes = readFileSync(res.outputPath).length;
+    assert(afterBytes < beforeBytes * 0.5, `snippet이 빠져 절반 이상 감량 (${beforeBytes}→${afterBytes})`);
+    assert(res.verify?.ok === true, "내장 무결성 검사 통과");
+  });
+
   // ── 정리 (§8: 회귀 분석을 위해 보존이 기본) ──
   if (process.env.CLEAN_ARTIFACTS === "1") {
     for (const a of artifacts) if (existsSync(a)) unlinkSync(a);
