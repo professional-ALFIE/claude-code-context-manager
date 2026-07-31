@@ -175,6 +175,7 @@ const CLEANED_BASH_TAGS = "[context-cleaner: bash-output]";
 const CLEANED_LOCAL_CMD_OUTPUT = "[context-cleaner: local-cmd-output]";
 const CLEANED_USER_MARKED = "[context-cleaner: user-marked]";
 const CLEANED_TASK_OUTPUT = "[context-cleaner: taskoutput]";
+const CLEANED_TASK_PROMPT = "[context-cleaner: agent_prompt]";
 const CLEANED_BASH_PROGRESS = "[context-cleaner: bashoutput]";
 const CLEANED_AGENT_PROMPT = "[context-cleaner: agent_prompt]";
 const CLEANED_BASE64_IMAGE =
@@ -717,15 +718,26 @@ function cleanListToolUseResult(o: Row, stats: CleaningStats): boolean {
   } catch { return false; }
 }
 
+// 서브에이전트 결과는 toolUseResult.task 안에 네 자리로 흩어져 있다.
+//   .output  31B 안내문 ("Task output retrieved separately")
+//   .result  본문 — 실측(838ef40d) 28,047B. 여기가 실제 덩어리다
+//   .prompt  서브에이전트에 준 지시문. 호출 쪽 input.prompt와 같은 값의 사본이며
+//            그쪽은 cleanToolUseInputPrompt가 이미 치운다 (두 자리 중 한쪽만 지우던 상태였다)
+// task_id·task_type·status·description은 무엇을 위임했는지의 색인이라 보존한다.
 function cleanTaskOutput(o: Row, stats: CleaningStats): boolean {
   try {
     const task = o?.toolUseResult?.task;
-    if (task && typeof task === "object" && "output" in task && task.output && task.output !== CLEANED_TASK_OUTPUT) {
-      stats.taskOutputBytes += byteLen(task.output);
-      task.output = CLEANED_TASK_OUTPUT; // description은 보존 (무엇을 위임했는지 맥락)
-      stats.taskOutputCount++;
-      return true;
+    if (!task || typeof task !== "object") return false;
+    let cleaned = false;
+    for (const [key, placeholder] of [["output", CLEANED_TASK_OUTPUT], ["result", CLEANED_TASK_OUTPUT], ["prompt", CLEANED_TASK_PROMPT]] as const) {
+      const v = task[key];
+      if (typeof v === "string" && v.length > 0 && v !== placeholder) {
+        stats.taskOutputBytes += byteLen(v);
+        task[key] = placeholder;
+        cleaned = true;
+      }
     }
+    if (cleaned) { stats.taskOutputCount++; return true; }
     return false;
   } catch { return false; }
 }
@@ -979,6 +991,15 @@ function cleanBase64Images(o: Row, stats: CleaningStats): boolean {
 function cleanToolUseResultString(o: Row, stats: CleaningStats): boolean {
   try {
     const result = o?.toolUseResult;
+    // MCP 도구는 toolUseResult 자체가 문자열이다 (아래 객체 분기의 typeof 검사에서 탈락하던 자리).
+    // 실측(f3aea91e): mcp__remote_tavily__tavily_extract 등 19건 30,184B가 그대로 남아 있었다.
+    // 무엇을 요청했는지는 tool_use.input에 남으므로 색인은 잃지 않는다.
+    if (typeof result === "string" && result.length > 200 && result !== CLEANED_TOOL_RESULT_STRING) {
+      stats.toolResultStringBytes += byteLen(result);
+      stats.toolResultStringCount++;
+      o.toolUseResult = CLEANED_TOOL_RESULT_STRING;
+      return true;
+    }
     if (result && typeof result === "object" && typeof result.result === "string" && result.result.length > 200 && result.result !== CLEANED_TOOL_RESULT_STRING) {
       stats.toolResultStringBytes += byteLen(result.result);
       stats.toolResultStringCount++;

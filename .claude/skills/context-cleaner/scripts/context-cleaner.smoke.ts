@@ -766,6 +766,73 @@ async function main() {
     assert(res.verify?.ok === true, "내장 무결성 검사 통과");
   });
 
+  // T21 ──────────────────────────────────────────────────────────────
+  // toolUseResult에 도구 결과 원본이 두 자리로 남던 문제 (base64와 같은 유형).
+  // message.content 쪽 표시용 사본은 이미 치환되는데 원본만 살아남았다.
+  //
+  // ① MCP 결과: toolUseResult 자체가 문자열이다.
+  //    기존 cleanToolUseResultString은 typeof result === "object"를 먼저 검사해서
+  //    최상위가 문자열이면 탈락했다. 실측(f3aea91e): 19건 30,184B 전부 통과.
+  // ② Task 결과: 본문은 .task.result에 있다.
+  //    기존 cleanTaskOutput은 .task.output만 봤는데 그건 31B 안내문이고
+  //    실제 28,047B는 .result에 있었다 → 31B 지우고 28KB를 남긴 셈.
+  //    .prompt(2,220B)는 호출 쪽 input.prompt가 이미 치환되는 값의 사본이다.
+  // 색인(task_id·description·status·retrieval_status)은 무엇을 위임했는지의 맥락이라 보존한다.
+  await test("T21 fixture: MCP 문자열·task.result·task.prompt가 치환되고 색인은 보존된다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "turesult");
+    const sid = "fixture-turesult-000-000000000001";
+    const mcpBody = JSON.stringify({ results: [{ url: "https://diataxis.fr/tutorials/", raw_content: "본문 ".repeat(400) }] });
+    const taskResult = Array.from({ length: 60 }, (_, i) => `${i + 1}. 조사 결과 항목 ${i}`).join("\n");
+    const taskPrompt = "structured-schema 4문서를 조사하라. ".repeat(40);
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "조사해줘" }, uuid: "u-1", timestamp: "2026-07-31T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t-mcp", name: "mcp__remote_tavily__tavily_extract", input: { urls: ["https://diataxis.fr/tutorials/"] } }] }, uuid: "a-1", timestamp: "2026-07-31T00:00:01.000Z", sessionId: sid }),
+      // MCP: toolUseResult 자체가 문자열
+      JSON.stringify({ parentUuid: "a-1", type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t-mcp", content: mcpBody }] }, uuid: "u-2", timestamp: "2026-07-31T00:00:02.000Z", sessionId: sid, toolUseResult: mcpBody }),
+      JSON.stringify({ parentUuid: "u-2", type: "assistant", message: { role: "assistant", content: [{ type: "tool_use", id: "t-task", name: "Agent", input: { prompt: taskPrompt } }] }, uuid: "a-2", timestamp: "2026-07-31T00:00:03.000Z", sessionId: sid }),
+      // Task: 본문은 .task.result, 안내문은 .task.output
+      JSON.stringify({ parentUuid: "a-2", type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t-task", content: "done" }] }, uuid: "u-3", timestamp: "2026-07-31T00:00:04.000Z", sessionId: sid, toolUseResult: { retrieval_status: "retrieved", task: { task_id: "a3211ce5e1952b229", task_type: "local_agent", status: "completed", description: "structured-schema 조사", output: "Task output retrieved separately", prompt: taskPrompt, result: taskResult, isRawTranscript: false } } }),
+      JSON.stringify({ parentUuid: "u-3", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "조사 완료했습니다" }] }, uuid: "a-3", timestamp: "2026-07-31T00:00:05.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+    const beforeBytes = readFileSync(F).length;
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+
+    // Assert ── ① MCP 문자열 치환
+    const mcpRow = after.find((r) => r.o?.uuid === "u-2");
+    const mcpTur = mcpRow?.o?.toolUseResult;
+    assert(typeof mcpTur === "string" && mcpTur.length < 100, `MCP toolUseResult 문자열 치환 (실제 ${String(mcpTur).length}자)`);
+    assert(String(mcpTur).includes("context-cleaner"), "placeholder 형식은 기존과 동일");
+    // 호출 인자는 무엇을 요청했는지의 색인이므로 남는다
+    const mcpCall = after.find((r) => r.o?.uuid === "a-1");
+    assert(mcpCall?.o?.message?.content?.[0]?.input?.urls?.[0] === "https://diataxis.fr/tutorials/", "MCP 호출 인자(색인) 보존");
+
+    // ② task.result·task.prompt 치환
+    const taskRow = after.find((r) => r.o?.uuid === "u-3");
+    const task = taskRow?.o?.toolUseResult?.task;
+    assert(typeof task?.result === "string" && task.result.length < 100, `task.result 치환 (실제 ${String(task?.result).length}자)`);
+    assert(typeof task?.prompt === "string" && task.prompt.length < 100, `task.prompt 치환 (실제 ${String(task?.prompt).length}자)`);
+
+    // ③ 색인 보존 — 무엇을 위임했는지의 맥락
+    assert(task?.task_id === "a3211ce5e1952b229", "task_id(색인) 보존");
+    assert(task?.description === "structured-schema 조사", "description(위임 맥락) 보존");
+    assert(task?.status === "completed", "status 보존");
+    assert(taskRow?.o?.toolUseResult?.retrieval_status === "retrieved", "retrieval_status 보존");
+
+    // ④ 감량과 무결성
+    const afterBytes = readFileSync(res.outputPath).length;
+    assert(afterBytes < beforeBytes * 0.4, `원본 두 자리가 빠져 60% 이상 감량 (${beforeBytes}→${afterBytes})`);
+    const us = uuidSet(after);
+    assert(after.filter((r) => r.o?.parentUuid && !us.has(r.o.parentUuid)).length === 0, "고아 parentUuid 0개");
+    assert(res.verify?.ok === true, "내장 무결성 검사 통과");
+  });
+
   // ── 정리 (§8: 회귀 분석을 위해 보존이 기본) ──
   if (process.env.CLEAN_ARTIFACTS === "1") {
     for (const a of artifacts) if (existsSync(a)) unlinkSync(a);
