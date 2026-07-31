@@ -42,13 +42,13 @@
  *     ③ file-history-snapshot.messageId — /rewind 파일 복원용, user 행 uuid와 1:1
  *     ④ sourceToolAssistantUUID     — tool_result(user 행) → tool_use(assistant 행) 역참조
  *   행을 삭제하면 ①②④는 "살아남은 조상"으로 재매핑하고, ③은 대상이 사라졌으면 스냅샷 행도
- *   함께 삭제한다. 실사례: 씨발새끼야-안됨.jsonl의 첫 last-prompt 앵커(31845162)가 바로
- *   SessionStart 훅 attachment 행이었다 — 훅을 지우면서 ②를 재매핑하지 않으면 앵커가 끊긴다.
+ *   함께 삭제한다. 실제 regression transcript에서 첫 last-prompt 앵커가 SessionStart 훅
+ *   attachment 행을 가리킨 사례가 있었다 — 훅을 지우면서 ②를 재매핑하지 않으면 앵커가 끊긴다.
  *
  * [핵심 원칙 3 — 조상 기반 재연결 (v4 python과 다른 점)]
  *   v4는 삭제된 uuid를 "파일 순서상 직전에 살아남은 행"으로 재연결했다.
  *   평행세계(한 파일에 parentUuid 갈래 여러 개) 파일에서는 파일 순서가 갈래를 넘나들기
- *   때문에, 그 방식은 남의 갈래에 체인을 접붙일 수 있다 (안됨본 구조로 실증된 위험:
+ *   때문에, 그 방식은 남의 갈래에 체인을 접붙일 수 있다 (regression transcript로 실증된 위험:
  *   a갈래 행 사이사이에 b갈래 행이 끼어 있음). v5는 삭제된 행의 "자기 parentUuid 사슬"을
  *   따라 올라가 가장 가까운 살아남은 조상으로 재연결한다. 조상이 전부 삭제됐으면 null(root).
  *
@@ -69,14 +69,14 @@
  *     + signature, 내용만 요약 텍스트)라서 같은 삭제 규칙 하나로 처리된다. (실물 확인: 2026-07-07)
  *   - [thinking+text] 혼합 행은 실측된 적 없음 → 사전 방어 설계 없이 "모든 블록이 thinking류인
  *     행만 삭제"라는 규칙 하나만 둔다. 혼합이 실존하면 자연히 살아남고 통계(mixedThinkingRows)로
- *     보고되므로 그때 처리한다. (주인님 지시: 없는 걸 예상해서 설계하지 말 것)
+ *     보고되므로 실제 사례가 확인된 뒤 처리한다.
  *
  * [지식: 합성(synthetic) 행 — 왜 지우고, 왜 '지울 후보 1순위'인가]
  *   정체: CC가 resume 시 "응답 없이 끝난(pending) user 메시지"를 발견하면, 대화 상태를
  *   정리하려고 스스로 끼워 넣는 가짜 한 쌍이다:
  *     - user 행:      isMeta:true + text "Continue from where you left off."
  *     - assistant 행: message.model = "<synthetic>" (텍스트 "No response requested.")
- *   즉 모델이 생성한 응답도, 사람이 친 입력도 아닌 '접착제'다. (실물: 실험파일 299cb302, 2026-07-06)
+ *   즉 모델이 생성한 응답도, 사람이 친 입력도 아닌 '접착제'다. (실물 transcript에서 확인, 2026-07-06)
  *   지울 후보 1순위인 이유:
  *     ① 대화 정보량이 0 — 흐름 기억에 기여하는 바이트가 한 글자도 없다.
  *     ② resume을 반복할 때마다 쌓인다 — 평행세계 운용(자주 열고 닫음)에서 순수 오염원.
@@ -109,7 +109,7 @@
  *     - fix-session의 고아 정의: "부모가 대화 타입({user,assistant,system,summary})이 아니면
  *       고아로 보고 재연결" — 이는 옛 버그(#22107, progress uuid 오염) 수리용 정의다.
  *       v2.1.201 정상 파일에서는 user 행의 부모가 system(turn_duration)/attachment인 것이
- *       "정상"임을 실측했다(안됨본). 그 정의를 그대로 쓰면 건강한 체인을 오히려 파괴한다.
+ *       "정상"임을 regression transcript에서 실측했다. 그 정의를 그대로 쓰면 건강한 체인을 오히려 파괴한다.
  *       → v5의 고아 정의는 "파일 안 어떤 uuid로도 해소되지 않는 parentUuid"뿐이다.
  *     - 파일 순서 기반 재연결 → [핵심 원칙 3]의 조상 기반으로 대체.
  *
@@ -183,6 +183,8 @@ const CLEANED_TOOL_RESULT_STRING = "[context-cleaner: tool_result_string]";
 const CLEANED_TEAMMATE_MESSAGE = "[context-cleaner: teammate_message]";
 const CLEANED_ATTACHMENT = "[context-cleaner: attachment]";
 const CLEANED_META_CONTENT = "[context-cleaner: meta]";
+const CLEANED_WORKFLOW_SCRIPT = "[context-cleaner: workflow_script]";
+const CLEANED_ATTACHMENT_SNIPPET = "[context-cleaner: snippet]";
 
 // 정규식 (python re.DOTALL → [\s\S])
 const BASH_TAGS_PATTERN =
@@ -265,6 +267,7 @@ class CleaningStats {
   localCommandStdoutCount = 0; localCommandStdoutBytes = 0;
   toolUseInputPromptCount = 0; toolUseInputPromptBytes = 0;
   attachmentCount = 0; attachmentBytes = 0;
+  workflowScriptCount = 0; workflowScriptBytes = 0;
   // ── v4 계승 (행 삭제) ──
   localCmdRowsDeleted = 0;
   // ── v5 신규 (행 삭제) ──
@@ -288,6 +291,7 @@ class CleaningStats {
       this.userMarkedBytes + this.taskOutputBytes + this.bashProgressBytes + this.metaContentBytes +
       this.localCmdOutputBytes + this.agentProgressBytes + this.taskContentTextBytes +
       this.base64ImageBytes + this.toolResultStringBytes + this.teammateMessageBytes +
+      this.workflowScriptBytes +
       this.toolUseResultPromptBytes + this.localCommandStdoutBytes + this.toolUseInputPromptBytes +
       this.attachmentBytes
     );
@@ -326,6 +330,7 @@ class CleaningStats {
     L("Local cmd stdout:", this.localCommandStdoutCount, this.localCommandStdoutBytes);
     L("ToolUse inp prompt:", this.toolUseInputPromptCount, this.toolUseInputPromptBytes);
     L("Attachments:", this.attachmentCount, this.attachmentBytes);
+    L("Workflow scripts:", this.workflowScriptCount, this.workflowScriptBytes);
     console.log(`\n🗑  Row Deletions (행 삭제 + 재매핑):`);
     console.log(`  Thinking rows:       ${String(this.thinkingRowsDeleted).padStart(4)} deleted (${this.thinkingRowsBytes.toLocaleString()} bytes)`);
     console.log(`  Hook rows:           ${String(this.hookRowsDeleted).padStart(4)} deleted (${this.hookRowsBytes.toLocaleString()} bytes)`);
@@ -418,6 +423,17 @@ function cleanAttachment(o: Row, stats: CleaningStats, keepHookContent: boolean)
     if (keepHookContent && typeof attachment.type === "string" && attachment.type.startsWith("hook_")) return false;
     const content = attachment.content;
     let cleaned = false;
+    // 외부에서 파일이 바뀐 것을 알리는 첨부(type="edited_text_file")는 본문을
+    // content가 아니라 snippet에 담는다 → v4 규칙이 이 자리를 지나쳤다.
+    // 실측(2026-07-31): 8행 57,128B가 남아 컨텍스트 Messages를 14.6k 더 먹고 있었다
+    // (제거 후 80.4k→65.8k). 대상 파일은 디스크에 실물로 있고 filename이 남으므로
+    // 유일본이 아니다. 행은 uuid를 갖고 자식이 매달려 있어 삭제하지 않고 값만 치환한다.
+    if (typeof attachment.snippet === "string" && attachment.snippet && attachment.snippet !== CLEANED_ATTACHMENT_SNIPPET) {
+      stats.attachmentCount++;
+      stats.attachmentBytes += byteLen(attachment.snippet);
+      attachment.snippet = CLEANED_ATTACHMENT_SNIPPET;
+      cleaned = true;
+    }
     if (typeof content === "string") {
       if (content && content !== CLEANED_ATTACHMENT) {
         stats.attachmentCount++;
@@ -458,6 +474,16 @@ function cleanReadResult(o: Row, stats: CleaningStats): boolean {
     const fileObj = o?.toolUseResult?.file;
     if (!fileObj || typeof fileObj !== "object") return false;
     let cleaned = false;
+    // 도구가 반환한 이미지의 두 번째 사본. 같은 이미지가 message.content 쪽
+    // tool_result 안에도 들어 있어 두 자리를 함께 지워야 실효가 있다.
+    // 치환값은 반드시 유효한 1x1 PNG — API가 이 값을 디코딩하므로 깨진 값은 400을 낸다.
+    // originalSize·dimensions·type 같은 메타는 건드리지 않는다(content 필드와 동일 원칙).
+    if ("base64" in fileObj && typeof fileObj.base64 === "string" && fileObj.base64 !== CLEANED_BASE64_IMAGE) {
+      stats.base64ImageCount++;
+      stats.base64ImageBytes += byteLen(fileObj.base64);
+      fileObj.base64 = CLEANED_BASE64_IMAGE;
+      cleaned = true;
+    }
     if ("content" in fileObj && fileObj.content && fileObj.content !== CLEANED_FILE_CONTENT) {
       stats.readCount++;
       stats.readBytes += byteLen(fileObj.content);
@@ -908,26 +934,42 @@ function cleanMetaContent(o: Row, stats: CleaningStats): boolean {
   } catch { return false; }
 }
 
+/** image 블록 하나의 source.data를 1x1 PNG로 치환. (v4 계승 규칙을 함수로 분리) */
+function cleanImageBlock(item: any, stats: CleaningStats): boolean {
+  if (!item || typeof item !== "object" || item.type !== "image") return false;
+  const source = item.source;
+  if (!source || typeof source !== "object" || !("data" in source)) return false;
+  let cleaned = false;
+  if (source.data && source.data !== CLEANED_BASE64_IMAGE) {
+    stats.base64ImageBytes += byteLen(source.data);
+    source.data = CLEANED_BASE64_IMAGE;
+    stats.base64ImageCount++;
+    cleaned = true;
+  }
+  if (source.media_type !== "image/png") {
+    source.media_type = "image/png"; // placeholder가 png라서 media_type도 맞춤 (v4 계승)
+    cleaned = true;
+  }
+  return cleaned;
+}
+
+/** base64 이미지 치환. 이미지가 놓이는 자리는 두 가지다:
+ *    ① 붙여넣은 이미지 → message.content[]에 image 블록이 바로 놓인다 (v4가 알던 형태)
+ *    ② 도구가 반환한 이미지 → message.content[] → tool_result.content[] 안쪽에 놓인다
+ *  ②는 최상위에서 보면 type이 "tool_result"라 v4 규칙이 껍데기를 못 뚫고 지나쳤다.
+ *  실측(2026-07-31): 스크린샷 2장이 정리 후에도 남아 파일의 32%를 차지했고
+ *  리포트에는 "Base64 images: 0 cleaned"로 찍혔다. 같은 이미지의 두 번째 사본은
+ *  toolUseResult.file.base64에 있어 cleanReadResult가 함께 치운다. */
 function cleanBase64Images(o: Row, stats: CleaningStats): boolean {
   try {
     const content = o?.message?.content;
     if (!Array.isArray(content)) return false;
     let cleaned = false;
     for (const item of content) {
-      if (item && typeof item === "object" && item.type === "image") {
-        const source = item.source;
-        if (source && typeof source === "object" && "data" in source) {
-          if (source.data && source.data !== CLEANED_BASE64_IMAGE) {
-            stats.base64ImageBytes += byteLen(source.data);
-            source.data = CLEANED_BASE64_IMAGE;
-            stats.base64ImageCount++;
-            cleaned = true;
-          }
-          if (source.media_type !== "image/png") {
-            source.media_type = "image/png"; // placeholder가 png라서 media_type도 맞춤 (v4 계승)
-            cleaned = true;
-          }
-        }
+      if (cleanImageBlock(item, stats)) cleaned = true;
+      // tool_result 한 겹 안쪽 (중첩은 이 한 단계만 실측됨 — 더 깊은 재귀는 넣지 않는다)
+      if (item?.type === "tool_result" && Array.isArray(item.content)) {
+        for (const inner of item.content) if (cleanImageBlock(inner, stats)) cleaned = true;
       }
     }
     return cleaned;
@@ -998,6 +1040,29 @@ function cleanToolUseInputPrompt(o: Row, stats: CleaningStats): boolean {
   } catch { return false; }
 }
 
+/** Workflow 도구의 인라인 스크립트 전문(input.script, 최대 512KB) 치환.
+ *  실행 결과는 완료 알림(task-notification)에 남고, 스크립트 파일은 세션 폴더에 보존되므로
+ *  transcript에 전문을 다시 들고 갈 이유가 없다. 색인인 name·scriptPath는 손대지 않는다. */
+function cleanWorkflowScript(o: Row, stats: CleaningStats): boolean {
+  try {
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) return false;
+    let cleaned = false;
+    for (const item of content) {
+      if (!item || typeof item !== "object" || item.type !== "tool_use" || item.name !== "Workflow") continue;
+      const inp = item.input;
+      if (!inp || typeof inp !== "object") continue;
+      const s = inp.script;
+      if (typeof s !== "string" || s.length <= 100 || s.includes("[context-cleaner:")) continue;
+      stats.workflowScriptBytes += byteLen(s);
+      stats.workflowScriptCount++;
+      inp.script = CLEANED_WORKFLOW_SCRIPT;
+      cleaned = true;
+    }
+    return cleaned;
+  } catch { return false; }
+}
+
 function cleanLocalCommandStdout(o: Row, stats: CleaningStats): boolean {
   try {
     if (o?.type !== "user") return false;
@@ -1060,6 +1125,7 @@ function processLine(o: Row, newSessionId: string, stats: CleaningStats, keepHoo
   cleanToolUseResultPrompt(o, stats);
   cleanLocalCommandStdout(o, stats);
   cleanToolUseInputPrompt(o, stats);
+  cleanWorkflowScript(o, stats);
 }
 
 // ============================================================================
@@ -1126,6 +1192,22 @@ function isSyntheticRow(o: Row): boolean {
     return true;
   return false;
 }
+
+/* [지식: queue-operation 행 — 조사했으나 "삭제하지 않는다"로 결정됨 (2026-07-31)]
+ *   비동기 알림이나 사용자 입력이 응답 생성 중에 도착해 큐에 쌓였다(enqueue) 꺼내진
+ *   (dequeue/remove) 타이밍 기록. Workflow·Monitor·백그라운드 Bash를 쓰면 생긴다.
+ *
+ *   실측 (Workflow 2회 쓴 세션 440행): 20행 9,285바이트.
+ *     - uuid·parentUuid가 없어 체인에 참여하지 않는다 → 지워도 재매핑할 것이 없다.
+ *     - dequeue 7건은 content 필드조차 없다 (138B).
+ *     - content를 가진 13건은 전부 다른 행과 중복: 알림 5건은 같은 본문이
+ *       origin.kind="task-notification" user 행에, 사용자 발화 2건은
+ *       origin.kind="human" user 행에 존재(대조 확인). enqueue·remove는 쌍으로 중복.
+ *
+ *   즉 "지워도 안전하고 내용도 중복"이지만, 입력이 언제 도달해 언제 소비됐는지의
+ *   타이밍은 이 행에만 남는다. 그 기록을 남기는 편을 택했다 → 삭제 규칙을 넣지 않는다.
+ *   (다시 논의할 때 이 실측을 재조사하지 말 것. 결정만 바꾸면 된다.)
+ */
 
 // ============================================================================
 // 무결성 분석 (fix-session의 analyze 차용·개선판)
@@ -1279,7 +1361,7 @@ export function verifyAgainstBaseline(inputLines: string[], outputLines: string[
   //   roots===0은 잡지 않는다: 클리너는 user/assistant 대화 행을 삭제하지 않으므로(설계 불변)
   //   "대화 통째 소멸"은 구조적으로 불가능하다. --hooks keep 계열에선 첫 user의 parent가 살아있는
   //   훅 attachment라 정상임에도(F_기각) "대화타입 + parentUuid null"인 root가 0개로 세이는
-  //   케이스가 있어, ===0 판정은 정상 파일을 오잡하는 역할만 한다 (안됨본 keep/sessionstart 실측).
+  //   케이스가 있어, ===0 판정은 정상 파일을 오잡하는 역할만 한다 (regression transcript의 keep/sessionstart에서 실측).
   if (output.conversationRootCount > 1)
     problems.push(`다중 root ${output.conversationRootCount}개 (파편 root 발생)`);
   // §5.3 resume 앵커(마지막 last-prompt.leafUuid) — CC가 실제로 열 갈래의 건강도
@@ -1372,7 +1454,7 @@ export function lastCwd(rows: ReadonlyArray<{ o: Record<string, any> | null }>):
  * 실행하는 터미널의 셸이 그 자리에서 자기 홈으로 확장하므로, 어느 머신·어느 사용자명에서
  * 붙여넣어도 통한다 (기록된 cwd는 기록 당시 머신의 절대경로이므로).
  *  - 현재 홈으로 시작하면 그대로 토큰화.
- *  - 다른 홈(/Users/<이름>/…, /home/<이름>/…)이면 "현재 홈 기준으로 실존할 때만" 토큰화 —
+ *  - 다른 계정의 홈 경로이면 "현재 홈 기준으로 실존할 때만" 토큰화 —
  *    진짜 다른 계정의 경로를 엉뚱한 곳으로 틀어버리는 오치환 방지.
  *    실존 안 하면 원문 유지(cd 실패가 눈에 보이도록).
  *  - 주의: ${HOME}은 홑따옴표 안에서 확장되지 않는다 — 인용은 buildResumeCommand가

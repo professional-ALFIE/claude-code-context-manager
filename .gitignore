@@ -1,3 +1,8 @@
 .DS_Store
 __pycache__/
 *.pyc
+
+# 스모크 테스트 산출물 (§8 회귀 분석을 위해 로컬엔 보존, 저장소엔 넣지 않는다)
+# 클리너가 출력 파일명을 잘라내므로 fixtures- 뿐 아니라 fixtur00effaced… 꼴도 생긴다
+.claude/skills/context-cleaner/scripts/fixtur*
+.claude/skills/context-cleaner/scripts/fixtures-projects-root/

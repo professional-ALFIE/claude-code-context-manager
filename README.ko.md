@@ -64,6 +64,20 @@ After all steps, tell me to restart the session.
 > 명령어 안의 옵션·정규식·필드 오프셋 시행착오는 요약으로 복원되지 않습니다.
 > 두 동작 모두 **주석 한 줄**로 되돌릴 수 있습니다 — [되돌리기](#되돌리기-보존-vs-제거) 참조.
 
+> **2026-07-31 변경 — base64 이미지와 `attachment.snippet`.**
+> 도구가 반환한 스크린샷은 같은 이미지가 **두 곳**에 저장됩니다.
+> `tool_result.content[]` 안쪽의 `image.source.data`, 그리고 `toolUseResult.file.base64`입니다.
+> 기존 규칙은 최상위 배열만 훑어 `tool_result` 껍데기를 뚫지 못했고 두 번째 사본은 규칙 자체가
+> 없었습니다. 그래서 리포트에는 `Base64 images: 0 cleaned`로 찍히면서
+> **1,038,776 B(파일의 64%)** 가 그대로 남아 있었습니다.
+> 이제 두 자리 모두 동일한 1×1 PNG(96 B)로 치환하고 메타(`originalSize`·`dimensions`·`type`)는
+> 보존합니다. placeholder가 **유효한** PNG여야 하는 이유는 API가 이 값을 디코딩하기 때문입니다 —
+> 깨진 값을 넣으면 resume이 400으로 실패합니다.
+> 별개로 `attachment.snippet`(외부에서 파일이 바뀐 것을 알리는 첨부)은 본문을 `content`가 아니라
+> `snippet`에 담아 규칙이 지나쳤습니다. 8행 57,128 B로, 컨텍스트 **17k 토큰**에 해당합니다.
+> `filename`은 색인이라 보존하고 행 자체도 남깁니다 — 자식 행과 resume anchor가 가리키는
+> UUID를 지니고 있기 때문입니다.
+
 ### 동작 원리
 
 1. **클리닝** — 무거운 데이터(thinking, 파일 내용, bash 출력 등)를 제거하고 `[context-cleaner: Read]` 같은 가벼운 마커로 대체합니다

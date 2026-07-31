@@ -64,6 +64,20 @@ Preserves: conversation text, edit intent, UUID chains, resume anchors, branch t
 > and option/regex/field-offset trial-and-error inside a command is not recoverable from a summary.
 > Both behaviours are **one comment away** from returning — see [Reverting](#reverting-keep-vs-strip).
 
+> **Changed in 2026-07-31 — base64 images and `attachment.snippet`.**
+> Tool-returned screenshots are stored in *two* places: nested inside
+> `tool_result.content[]` as `image.source.data`, and again at
+> `toolUseResult.file.base64`. The old rule scanned only the top-level array, so it
+> never got past the `tool_result` wrapper, and the second copy had no rule at all —
+> reports read `Base64 images: 0 cleaned` while **1,038,776 B (64% of the file)** stayed.
+> Both are now replaced with the same valid 1×1 PNG (96 B); metadata
+> (`originalSize`, `dimensions`, `type`) is kept. The placeholder must remain a *valid*
+> PNG because the API decodes it — a malformed value makes resume fail with a 400.
+> Separately, `attachment.snippet` (how an externally-edited file is reported) was
+> missed because it carries its body in `snippet`, not `content`: 8 rows, 57,128 B,
+> worth **17k tokens** of context. Its `filename` is kept as the index, and the rows
+> themselves are preserved — they hold UUIDs that children and resume anchors point to.
+
 ### How it works
 
 1. **Cleans** — Removes heavy data (thinking, file contents, bash output, etc.) and replaces with lightweight markers like `[context-cleaner: Read]`

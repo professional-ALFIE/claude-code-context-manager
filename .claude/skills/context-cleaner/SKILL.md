@@ -120,12 +120,31 @@ The script (v5 TS):
 - in-place: 원본 경로에 덮어씀. fork: `00effaced{NNN}` 사본 + 새 uuid(기존 effaced 파일은 절대 덮어쓰지 않고 빈 번호로 증가)
 - Strips (값 치환): Read/Write/Edit **결과** contents, bash **stdout/stderr**, tool results, attachments, base64 images
   ※ 2026-07-28부터 **bash command와 file path는 지우지 않는다** (위 두 절 참조 — 주석 해제로 복귀 가능)
+- Strips (Workflow 인라인 스크립트): `tool_use.input.script` — 최대 512KB. 색인인 `name`·`scriptPath`는 보존
+- Strips (base64 이미지 — 두 자리를 함께): 도구가 반환한 스크린샷은 같은 이미지가 두 곳에 저장된다. ① `message.content[]` → `tool_result.content[]` 안쪽의 `image.source.data` ② `toolUseResult.file.base64`. 둘 다 유효한 1x1 PNG(96B)로 치환하고 메타(`originalSize`·`dimensions`·`type`)는 보존한다. 치환값이 유효한 PNG여야 하는 이유는 API가 이 값을 디코딩하므로 깨진 값이면 resume이 400으로 죽기 때문. **실측(2026-07-31): 스크린샷 2장이 1,038,776B(파일의 64%)를 차지했다** — v4는 ①을 최상위 배열에서만 찾아 `tool_result` 껍데기를 못 뚫었고 ②는 규칙이 없어 `Base64 images: 0 cleaned`로 찍혔다
+- Strips (`attachment.snippet`): 외부에서 파일이 바뀐 것을 알리는 첨부(`type="edited_text_file"`)는 본문을 `content`가 아니라 `snippet`에 담아 v4 규칙이 지나쳤다. `filename`(색인)·`type`·행 자체는 보존하고 값만 치환한다(행이 uuid를 갖고 자식이 매달려 있어 삭제하면 재매핑이 필요하다). **실측: 8행 57,128B, 제거 시 컨텍스트 Messages 80.4k→63.4k (17k 감소)**
 - Deletes (행 삭제 + 참조 재매핑): thinking rows (일반+summarized, signature 문제 원천 소멸), hook rows 3형태(`--hooks` 스위치), synthetic rows (`model="<synthetic>"` / "Continue from where you left off."), local-command rows
+- 삭제하지 않기로 결정된 것: `queue-operation` rows (비동기 알림·입력의 큐잉 타이밍 기록. 지워도 안전하고 내용도 다른 행과 중복이지만, 입력이 언제 도달해 언제 소비됐는지는 이 행에만 남으므로 보존한다 — 실측 근거는 본체 주석 참조)
 - Remaps on deletion: parentUuid(조상 사슬 기반), last-prompt.leafUuid(resume 앵커), sourceToolAssistantUUID, file-history-snapshot(대상 소멸 시 동반 삭제)
 - Verifies output — 기존(고아 0·사이클 0·참조 해소·깨진 줄 증가 없음) + [PLAN §5] **uuid 체인 판정 3종**: ① 최신 tip → root 도달 ② 다중 대화 root 감지(대화 root 0개는 hook-root 정상 케이스 때문에 실패로 보지 않음) ③ resume 앵커(last-prompt.leafUuid) 해소·root 도달. FAIL 시 exit 2
 - Preserves: conversation text, edit intent, uuid chain, last-prompt rows, 평행세계 갈래 tip,
-  **bash commands (전문)**, **full file paths**, Bash/Task description, row.cwd
+  **bash commands (전문)**, **full file paths**, Bash/Task description, row.cwd,
+  Workflow 완료 알림 본문(`<failures>`=실패 원인, `<diagnostics>`=journal.jsonl 경로·resumeFromRunId) 및 접수증 `toolUseResult`(runId·transcriptDir) — 실제 워크플로우 내역으로 가는 유일한 색인이라 지우지 않는다
 - Smoke test: `scripts/context-cleaner.smoke.ts` (실물 transcript 대상, 산출물 보존)
+
+### 감량 효과를 토큰으로 측정할 때 (파일 크기로 판단하지 말 것)
+
+파일이 줄어도 컨텍스트가 안 줄 수 있고, 그 반대도 있다. 실제 효과는 `/context`로 재야 한다.
+
+```bash
+claude -r <세션id> -p "안녕"      # ① 워밍업 대화 먼저 (필수)
+claude -r <세션id> -p "/context"  # ② 그 다음에 측정
+```
+
+①을 건너뛰면 `**Tokens:**` 헤더에 **갱신 전 옛 값**이 나온다. 실제로 이 함정 때문에
+"snippet은 컨텍스트에 안 실린다"고 잘못 판정한 적이 있다(두 사본이 똑같이 662.3k로 보였다).
+워밍업 후 다시 재니 80.4k vs 65.8k로 갈렸다. 비교는 `| Messages |` 행으로 한다 —
+System prompt·tools·Memory는 파일과 무관하게 동일하므로 차이가 곧 transcript 기여분이다.
 
 ## Step 3: Report Results
 
