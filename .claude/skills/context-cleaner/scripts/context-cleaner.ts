@@ -1246,6 +1246,8 @@ export type Analysis = {
   // ── [PLAN §5] uuid 체인 판정 3종의 원천 데이터 ──
   reachedRootFromNewestTip: boolean; // 최신 tip walk가 root에 도달했나 (중간 uuid 미해소로 멈추면 false)
   conversationRootCount: number;     // uuid 보유 + 대화타입(user/assistant/system/summary) + parentUuid null/없음 인 행 수
+  nonBoundaryRootCount: number;      // 위에서 compact_boundary를 뺀 수 (참고용 — 판정에는 쓰지 않는다)
+  conversationRootUuids: string[];   // 그 root들의 uuid — 입출력 대조 판정(§5.2)의 원천
   anchorLeafUuid: string | null;     // 파일상 마지막 last-prompt.leafUuid (CC resume의 실제 출발점 — F1)
   anchorResolvable: boolean;         // 앵커 leafUuid가 uuid 보유 행으로 해소되나
   reachedRootFromAnchor: boolean;    // 앵커에서 walk가 root에 도달하나
@@ -1312,9 +1314,15 @@ export function analyzeLines(lines: string[]): Analysis {
   // 비대화 메타행(uuid 없음)은 애초 제외. summary도 대화행이라 포함(F_summary_주의).
   const CONVERSATION_TYPES = new Set(["user", "assistant", "system", "summary"]);
   let conversationRootCount = 0;
+  let nonBoundaryRootCount = 0;
+  const conversationRootUuids: string[] = [];
   for (const o of objs) {
-    if (typeof o.uuid === "string" && CONVERSATION_TYPES.has(o.type as string) && (o.parentUuid === null || o.parentUuid === undefined))
+    if (typeof o.uuid === "string" && CONVERSATION_TYPES.has(o.type as string) && (o.parentUuid === null || o.parentUuid === undefined)) {
       conversationRootCount++;
+      if (o.type === "system" && o.subtype === "compact_boundary") continue;
+      nonBoundaryRootCount++;
+      conversationRootUuids.push(o.uuid as string);
+    }
   }
 
   // [PLAN §5.3] 앵커 walk: 파일상 마지막 last-prompt.leafUuid → root 도달 여부
@@ -1348,7 +1356,7 @@ export function analyzeLines(lines: string[]): Analysis {
     parseErrors, totalRows: objs.length, orphanParents, unresolvedLeafUuid,
     unresolvedSnapshotMessageId, unresolvedSourceTool, cycles,
     tipCount: tips.length, chainLengthFromNewestTip,
-    reachedRootFromNewestTip, conversationRootCount,
+    reachedRootFromNewestTip, conversationRootCount, nonBoundaryRootCount, conversationRootUuids,
     anchorLeafUuid, anchorResolvable, reachedRootFromAnchor,
   };
 }
@@ -1375,16 +1383,61 @@ export function verifyAgainstBaseline(inputLines: string[], outputLines: string[
   // §5.1 최신 tip walk가 root에 미도달 → 체인 끊김.
   //   주의: 클리너가 orphan parentUuid를 root화(6단계)하므로 정상 클리닝 출력에서는
   //   reachedRootFromNewestTip가 항상 true다. 이 판정은 "재매핑 실패로 orphan이 잔존"하는
-  //   드문 클리너 자체 버그를 잡는 안전망. 실제 끊김·파편 검출은 §5.2(roots)가 담당.
+  //   드문 클리너 자체 버그를 잡는 안전망. 실제 재매핑 실패 검출은 §5.2(입출력 uuid 대조)가 담당.
   if (output.tipCount > 0 && !output.reachedRootFromNewestTip)
     problems.push("최신 tip에서 root 미도달 — 체인 끊김 (재매핑 실패 잔존 가능)");
-  // §5.2 대화 root 수 — 다중 root(>1)만 잡는다 (파편 root / 체인 끊김의 주 증상).
-  //   roots===0은 잡지 않는다: 클리너는 user/assistant 대화 행을 삭제하지 않으므로(설계 불변)
-  //   "대화 통째 소멸"은 구조적으로 불가능하다. --hooks keep 계열에선 첫 user의 parent가 살아있는
-  //   훅 attachment라 정상임에도(F_기각) "대화타입 + parentUuid null"인 root가 0개로 세이는
-  //   케이스가 있어, ===0 판정은 정상 파일을 오잡하는 역할만 한다 (regression transcript의 keep/sessionstart에서 실측).
-  if (output.conversationRootCount > 1)
-    problems.push(`다중 root ${output.conversationRootCount}개 (파편 root 발생)`);
+  // §5.2 출력 root의 "개수"가 아니라 "생긴 원인"을 입출력 uuid로 대조한다.
+  //   정상 root:
+  //   ① compact_boundary — CC가 의도적으로 parentUuid=null을 기록한다.
+  //   ② 입력에서도 root — 클리너가 만든 변화가 아니다.
+  //   ③ 입력부터 부모가 미해소 — 원본의 기존 끊김이다(6단계가 키를 제거해 명시적 root로 정리).
+  //   ④ 입력의 부모가 출력에서 삭제됨 — 훅/thinking/로컬명령 삭제 후 resolveSurvivor가
+  //      살아있는 조상을 못 찾은 정상 결과다. 400 에러 후 같은 훅 부모를 공유한 재발화처럼
+  //      형제 여러 개가 동시에 root가 되어도 원본에 이미 있던 갈래가 드러난 것일 뿐이다.
+  //   오류는 입력의 부모가 출력에도 살아 있는데 자식의 parentUuid만 사라진 경우다.
+  //   실측(41개): 출력 root는 boundary 26, 삭제된 부모 25, 입력 root 17, 원본 고아 5,
+  //   살아있는 부모를 잃은 root 0. root 수 기준은 정상 갈래를 오탐하므로 폐기했다.
+  const inputRows: Row[] = [];
+  const outputRows: Row[] = [];
+  for (const line of inputLines) {
+    if (!line.trim()) continue;
+    try { inputRows.push(JSON.parse(line)); } catch { /* parseErrors가 별도 판정 */ }
+  }
+  for (const line of outputLines) {
+    if (!line.trim()) continue;
+    try { outputRows.push(JSON.parse(line)); } catch { /* parseErrors가 별도 판정 */ }
+  }
+  const inputByUuid = new Map(
+    inputRows.filter((o) => typeof o.uuid === "string").map((o) => [o.uuid as string, o]),
+  );
+  const outputUuids = new Set(
+    outputRows.filter((o) => typeof o.uuid === "string").map((o) => o.uuid as string),
+  );
+  const remapFailures: string[] = [];
+  for (const uuid of output.conversationRootUuids) {
+    const before = inputByUuid.get(uuid);
+    if (!before) {
+      remapFailures.push(`${uuid}(입력에 없던 대화 root)`);
+      continue;
+    }
+    if (before.parentUuid === null || before.parentUuid === undefined) continue;
+    // 입력의 parentUuid 사슬을 따라 가장 가까운 출력 생존 조상을 찾는다.
+    // 바로 부모가 삭제됐어도 그 위 조상이 살아 있으면 root가 아니라 그 조상에 재연결되어야 한다.
+    const seenAncestors = new Set<string>();
+    let ancestorUuid: string | null = before.parentUuid as string;
+    while (ancestorUuid !== null && !seenAncestors.has(ancestorUuid)) {
+      seenAncestors.add(ancestorUuid);
+      if (outputUuids.has(ancestorUuid)) {
+        remapFailures.push(`${uuid}(살아있는 조상 ${ancestorUuid} 유실)`);
+        break;
+      }
+      const ancestor = inputByUuid.get(ancestorUuid);
+      if (!ancestor || ancestor.parentUuid === null || ancestor.parentUuid === undefined) break;
+      ancestorUuid = ancestor.parentUuid as string;
+    }
+  }
+  if (remapFailures.length > 0)
+    problems.push(`parentUuid 재매핑 실패 ${remapFailures.length}개: ${remapFailures.join(", ")}`);
   // §5.3 resume 앵커(마지막 last-prompt.leafUuid) — CC가 실제로 열 갈래의 건강도
   if (output.anchorLeafUuid !== null && !output.anchorResolvable)
     problems.push("마지막 last-prompt.leafUuid가 미해소 uuid를 가리킴 — resume 앵커 끊김");

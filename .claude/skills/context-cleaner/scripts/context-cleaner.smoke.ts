@@ -110,7 +110,7 @@ async function main() {
     console.log(`\n🔴 RED: 본체 import 실패 — ${e}`);
     process.exit(1);
   }
-  const { cleanTranscript, parseHooksFlag, resolveTranscriptArg, buildResumeCommand, lastCwd, normalizeHomePrefix } = mod;
+  const { cleanTranscript, parseHooksFlag, resolveTranscriptArg, buildResumeCommand, lastCwd, normalizeHomePrefix, verifyAgainstBaseline } = mod;
 
   // 실물 transcript 경로 해석 (uuid → 현재 projects 폴더의 실제 경로)
   const 해석 = (uuid: string): string => {
@@ -414,11 +414,67 @@ async function main() {
     );
   });
 
+  // T8b ──────────────────────────────────────────────────────────────
+  // [§5.2] root 개수가 아니라 "출력에서 왜 root가 됐는가"를 입출력 대조한다.
+  // 첫 발화 취소/400 후 같은 훅 부모로 재발화한 갈래는 훅 삭제 후 root 2개가 되어도 정상이다.
+  await test("T8b 삭제된 공통 훅 부모의 두 user가 root가 되어도 정상", () => {
+    // Arrange
+    const input = [
+      JSON.stringify({ parentUuid: null, type: "attachment", attachment: { type: "hook_additional_context" }, uuid: "hook-1" }),
+      JSON.stringify({ parentUuid: "hook-1", type: "user", message: { role: "user", content: "첫 발화" }, uuid: "u-1" }),
+      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "API Error" }] }, isApiErrorMessage: true, uuid: "a-err" }),
+      JSON.stringify({ parentUuid: "hook-1", type: "user", message: { role: "user", content: "재발화" }, uuid: "u-2" }),
+    ];
+    const output = [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "첫 발화" }, uuid: "u-1" }),
+      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "API Error" }] }, isApiErrorMessage: true, uuid: "a-err" }),
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "재발화" }, uuid: "u-2" }),
+    ];
+    // Act
+    const report = verifyAgainstBaseline(input, output);
+    // Assert
+    assert(report.ok === true, `삭제된 공통 부모에서 나온 정상 갈래 통과 (실제: ${JSON.stringify(report.problems)})`);
+  });
+
+  await test("T8c 부모가 출력에 살아있는데 root가 되면 재매핑 실패", () => {
+    // Arrange
+    const input = [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "질문" }, uuid: "u-parent" }),
+      JSON.stringify({ parentUuid: "u-parent", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "답" }] }, uuid: "a-child" }),
+    ];
+    const output = [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "질문" }, uuid: "u-parent" }),
+      JSON.stringify({ parentUuid: null, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "답" }] }, uuid: "a-child" }),
+    ];
+    // Act
+    const report = verifyAgainstBaseline(input, output);
+    // Assert
+    assert(report.ok === false, "살아있는 부모를 잃은 root는 FAIL");
+    assert(report.problems.some((p: string) => /재매핑 실패/.test(p)), `실패 원인이 드러남 (실제: ${JSON.stringify(report.problems)})`);
+  });
+
+  await test("T8d 바로 부모가 삭제돼도 살아있는 조상이 있으면 그 조상에 재연결해야 한다", () => {
+    // Arrange
+    const input = [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "질문" }, uuid: "u-ancestor" }),
+      JSON.stringify({ parentUuid: "u-ancestor", type: "attachment", attachment: { type: "hook_success" }, uuid: "hook-parent" }),
+      JSON.stringify({ parentUuid: "hook-parent", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "답" }] }, uuid: "a-child" }),
+    ];
+    const output = [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "질문" }, uuid: "u-ancestor" }),
+      JSON.stringify({ parentUuid: null, type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "답" }] }, uuid: "a-child" }),
+    ];
+    // Act
+    const report = verifyAgainstBaseline(input, output);
+    // Assert
+    assert(report.ok === false, "살아있는 조상까지 건너뛴 root는 FAIL");
+    assert(report.problems.some((p: string) => /u-ancestor/.test(p)), `재연결할 조상이 진단에 드러남 (실제: ${JSON.stringify(report.problems)})`);
+  });
+
   // T9 ───────────────────────────────────────────────────────────────
-  // [PLAN §6 D3 / §5.2] 체인 끊김: 중간 행 parentUuid가 미존재 uuid.
-  // probe 실측 — 클리너가 orphan parentUuid를 root화(6단계)하므로 클리닝 후 roots=2(다중 root)로 변환.
-  // reachedRootFromNewestTip는 항상 true(안전망 전용), 실제 끊김 검출은 §5.2(roots>1).
-  await test("T9 체인 끊김(중간 parentUuid 미존재) → 클리닝 후 다중 root로 잡힌다", async () => {
+  // [§5.2] 원본부터 미해소인 parentUuid는 클리너가 만든 손상이 아니다.
+  // 6단계가 키를 제거해 명시적 root로 정리한 뒤 정상 통과해야 한다.
+  await test("T9 원본부터 미해소인 parentUuid → root로 정리하고 통과", async () => {
     const F = FIXTURE.replace("malformed", "dmg-chainbreak");
     const sid = "dmg-chainbreak-0000-0000-0000-000000000001";
     writeFileSync(F, [
@@ -427,15 +483,17 @@ async function main() {
       JSON.stringify({ parentUuid: "fake-uuid-notexist", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "끊김" }] }, uuid: "a-2", timestamp: "2026-07-09T00:00:02.000Z", sessionId: sid }),
     ].join("\n") + "\n");
     const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
-    assert(res.ok === true, "클리닝 자체는 성공(출력 생성)");
+    assert(res.ok === true, "클리닝 성공(출력 생성)");
     if (res.outputPath) artifacts.push(res.outputPath);
-    assert(res.verify?.ok === false, "verify FAIL — 체인 끊김이 감지됨");
-    assert(!!res.verify?.problems.some((p: string) => /다중 root/.test(p)), `problem에 '다중 root' 포함 (실제: ${JSON.stringify(res.verify?.problems)})`);
+    assert(res.verify?.ok === true, `원본 고아는 클리너 오류가 아니므로 통과 (실제: ${JSON.stringify(res.verify?.problems)})`);
+    const outRows = res.outputPath ? rows(res.outputPath) : [];
+    const repaired = outRows.find((r) => r.o?.uuid === "a-2")?.o;
+    assert(repaired && !("parentUuid" in repaired), "미해소 parentUuid 키를 제거해 명시적 root로 정리");
   });
 
   // T10 ──────────────────────────────────────────────────────────────
-  // [PLAN §6 D3 / §5.2] 다중 root: 대화 parentUuid null이 2개.
-  await test("T10 다중 root(대화행 parentUuid null 2개) → 다중 root로 잡힌다", async () => {
+  // [§5.2] 입력부터 존재한 다중 root는 클리너가 만든 변화가 아니다.
+  await test("T10 입력부터 존재한 다중 root → 그대로 통과", async () => {
     const F = FIXTURE.replace("malformed", "dmg-multiroot");
     const sid = "dmg-multiroot-0000-0000-0000-000000000002";
     writeFileSync(F, [
@@ -445,8 +503,7 @@ async function main() {
     ].join("\n") + "\n");
     const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
     if (res.outputPath) artifacts.push(res.outputPath);
-    assert(res.verify?.ok === false, "verify FAIL — 다중 root 감지");
-    assert(!!res.verify?.problems.some((p: string) => /다중 root/.test(p)), `problem에 '다중 root' 포함 (실제: ${JSON.stringify(res.verify?.problems)})`);
+    assert(res.verify?.ok === true, `입력부터 있던 root는 클리너 오류가 아니므로 통과 (실제: ${JSON.stringify(res.verify?.problems)})`);
   });
 
   // T11 ──────────────────────────────────────────────────────────────
@@ -554,15 +611,15 @@ async function main() {
 
   // T16 ──────────────────────────────────────────────────────────────
   // [PLAN D5] in-place + 검증 실패 → 원본 무손상. R1(원본 보호는 원자성으로)의 핵심 검증.
-  // 체인 끊김 fixture는 verify FAIL(다중 root)을 유발 → rename 안 함 → 사본(원본) 무손상.
-  await test("T16 in-place + 손상(체인 끊김) → 원본 무손상, 임시파일 미생성, ok=false", async () => {
+  // resume 앵커 미해소 fixture는 verify FAIL → rename 안 함 → 사본(원본) 무손상.
+  await test("T16 in-place + resume 앵커 미해소 → 원본 무손상, 임시파일 미생성, ok=false", async () => {
     const ORIG = FIXTURE.replace("malformed", "inplace-dmg-orig");
     const WORK = FIXTURE.replace("malformed", "inplace-dmg-work"); // 사본 = in-place 대상 (R6)
     const sid = path.basename(WORK, ".jsonl");
     writeFileSync(ORIG, [
       JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "q" }, uuid: "u-1", timestamp: "2026-07-09T00:00:00.000Z", sessionId: sid }),
       JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "a1" }] }, uuid: "a-1", timestamp: "2026-07-09T00:00:01.000Z", sessionId: sid }),
-      JSON.stringify({ parentUuid: "fake-notexist", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "끊김" }] }, uuid: "a-2", timestamp: "2026-07-09T00:00:02.000Z", sessionId: sid }),
+      JSON.stringify({ type: "last-prompt", leafUuid: "fake-notexist" }),
     ].join("\n") + "\n");
     writeFileSync(WORK, readFileSync(ORIG, "utf8"));
     const workHashBefore = sha(WORK);
@@ -570,21 +627,21 @@ async function main() {
     const res = await cleanTranscript(WORK, { hooks: parseHooksFlag(undefined), mode: "inplace" });
     // Assert
     assert(res.ok === false, "ok=false (검증 실패 → 정리본 미생성)");
-    assert(res.verify?.ok === false, "verify FAIL (다중 root)");
-    assert(!!res.verify?.problems.some((p: string) => /다중 root/.test(p)), "problem에 '다중 root'");
+    assert(res.verify?.ok === false, "verify FAIL (resume 앵커 미해소)");
+    assert(!!res.verify?.problems.some((p: string) => /resume 앵커|last-prompt/.test(p)), "problem에 resume 앵커 원인 포함");
     assert(sha(WORK) === workHashBefore, "사본(원본) 내용 무손상 (R1 — rename 안 됨)");
     assert(!existsSync(`${WORK}.tmp-${process.pid}`), "임시파일 미생성");
   });
 
   // T17 ──────────────────────────────────────────────────────────────
   // CLI 사용자는 내부 verify 객체를 볼 수 없으므로, 실패 stderr에 상세 원인이 드러나야 한다.
-  await test("T17 CLI in-place 실패 출력: stderr에 상세 원인(다중 root)이 나온다", async () => {
+  await test("T17 CLI in-place 실패 출력: stderr에 resume 앵커 원인이 나온다", async () => {
     const WORK = FIXTURE.replace("malformed", "cli-dmg-detail-work");
     const sid = path.basename(WORK, ".jsonl");
     writeFileSync(WORK, [
       JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "q" }, uuid: "u-1", timestamp: "2026-07-09T00:00:00.000Z", sessionId: sid }),
       JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "a1" }] }, uuid: "a-1", timestamp: "2026-07-09T00:00:01.000Z", sessionId: sid }),
-      JSON.stringify({ parentUuid: "fake-notexist", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "broken" }] }, uuid: "a-2", timestamp: "2026-07-09T00:00:02.000Z", sessionId: sid }),
+      JSON.stringify({ type: "last-prompt", leafUuid: "fake-notexist" }),
     ].join("\n") + "\n");
     const beforeHash = sha(WORK);
     const cli = spawnSync("./context-cleaner.ts", [WORK], {
@@ -592,7 +649,7 @@ async function main() {
       encoding: "utf8",
     });
     assert(cli.status === 2, `CLI exit code 2 (실제: ${cli.status})`);
-    assert(cli.stderr.includes("다중 root"), `stderr에 상세 원인 포함 (stderr: ${cli.stderr.trim()})`);
+    assert(/resume 앵커|last-prompt/.test(cli.stderr), `stderr에 상세 원인 포함 (stderr: ${cli.stderr.trim()})`);
     assert(sha(WORK) === beforeHash, "CLI 실패 시 원본 내용 무손상");
   });
 
