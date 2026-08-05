@@ -186,6 +186,10 @@ const CLEANED_ATTACHMENT = "[context-cleaner: attachment]";
 const CLEANED_META_CONTENT = "[context-cleaner: meta]";
 const CLEANED_WORKFLOW_SCRIPT = "[context-cleaner: workflow_script]";
 const CLEANED_ATTACHMENT_SNIPPET = "[context-cleaner: snippet]";
+const CLEANED_QUEUE_OP = "[context-cleaner: queue_op]";
+const CLEANED_TASK_RESULT = "[context-cleaner: task_result]";
+const CLEANED_ORIGIN_BODY = "[context-cleaner: origin_body]";
+const CLEANED_AGENT_MESSAGE = "[context-cleaner: agent_message]";
 
 // 정규식 (python re.DOTALL → [\s\S])
 const BASH_TAGS_PATTERN =
@@ -193,6 +197,8 @@ const BASH_TAGS_PATTERN =
 const USER_MARKED_PATTERN = /<clean>[\s\S]*?<\/clean>/g;
 const TEAMMATE_MESSAGE_PATTERN = /(<teammate-message[^>]*>)[\s\S]*?(<\/teammate-message>)/g;
 const LOCAL_COMMAND_STDOUT_PATTERN = /(<local-command-stdout>)[\s\S]*?(<\/local-command-stdout>)/g;
+const TASK_RESULT_PATTERN = /(<result>)[\s\S]*?(<\/result>)/g;
+const AGENT_MESSAGE_PATTERN = /(<agent-message[^>]*>)[\s\S]*?(<\/agent-message>)/g;
 
 // ============================================================================
 // zod 상위 계약 — "우리가 읽고 분기하는 필드"의 의미 고정
@@ -269,6 +275,10 @@ class CleaningStats {
   toolUseInputPromptCount = 0; toolUseInputPromptBytes = 0;
   attachmentCount = 0; attachmentBytes = 0;
   workflowScriptCount = 0; workflowScriptBytes = 0;
+  queueOpCount = 0; queueOpBytes = 0;
+  taskNotifyCount = 0; taskNotifyBytes = 0;
+  originBodyCount = 0; originBodyBytes = 0;
+  agentMessageCount = 0; agentMessageBytes = 0;
   // ── v4 계승 (행 삭제) ──
   localCmdRowsDeleted = 0;
   // ── v5 신규 (행 삭제) ──
@@ -294,7 +304,8 @@ class CleaningStats {
       this.base64ImageBytes + this.toolResultStringBytes + this.teammateMessageBytes +
       this.workflowScriptBytes +
       this.toolUseResultPromptBytes + this.localCommandStdoutBytes + this.toolUseInputPromptBytes +
-      this.attachmentBytes
+      this.attachmentBytes +
+      this.queueOpBytes + this.taskNotifyBytes + this.originBodyBytes + this.agentMessageBytes
     );
   }
 
@@ -332,6 +343,10 @@ class CleaningStats {
     L("ToolUse inp prompt:", this.toolUseInputPromptCount, this.toolUseInputPromptBytes);
     L("Attachments:", this.attachmentCount, this.attachmentBytes);
     L("Workflow scripts:", this.workflowScriptCount, this.workflowScriptBytes);
+    L("Queue-op content:", this.queueOpCount, this.queueOpBytes);
+    L("Task notify result:", this.taskNotifyCount, this.taskNotifyBytes);
+    L("Origin body:", this.originBodyCount, this.originBodyBytes);
+    L("Agent message:", this.agentMessageCount, this.agentMessageBytes);
     console.log(`\n🗑  Row Deletions (행 삭제 + 재매핑):`);
     console.log(`  Thinking rows:       ${String(this.thinkingRowsDeleted).padStart(4)} deleted (${this.thinkingRowsBytes.toLocaleString()} bytes)`);
     console.log(`  Hook rows:           ${String(this.hookRowsDeleted).padStart(4)} deleted (${this.hookRowsBytes.toLocaleString()} bytes)`);
@@ -1102,6 +1117,75 @@ function cleanLocalCommandStdout(o: Row, stats: CleaningStats): boolean {
   } catch { return false; }
 }
 
+/** queue-operation 행의 content 축소 — 행·operation·timestamp는 보존 (2026-08-05 결정).
+ *  실측(37d93cea): enqueue 27건 중 23건(85.2%)이 이후 정식 user 행과 중복.
+ *  행 자체는 "삭제하지 않는다"(2026-07-31 결정)를 유지 — 타이밍 기록은 남고 본문만 준다. */
+function cleanQueueOperation(o: Row, stats: CleaningStats): boolean {
+  try {
+    if (o?.type !== "queue-operation") return false;
+    const c = o.content;
+    if (typeof c !== "string" || c.length <= 200 || c.includes("[context-cleaner:")) return false;
+    stats.queueOpBytes += byteLen(c) - byteLen(CLEANED_QUEUE_OP);
+    stats.queueOpCount++;
+    o.content = CLEANED_QUEUE_OP;
+    return true;
+  } catch { return false; }
+}
+
+/** task-notification user 행의 <result> 내부만 축소 — 껍데기(task-id·status·summary 등) 보존.
+ *  실측(37d93cea): 21행 165,976B 중 result가 150,580B(90.7%). 결과 전문은 output-file에 남는다. */
+function cleanTaskNotificationResult(o: Row, stats: CleaningStats): boolean {
+  try {
+    if (o?.type !== "user") return false;
+    const message = o.message;
+    if (!message || typeof message !== "object") return false;
+    const content = message.content;
+    if (typeof content !== "string" || !content.includes("<task-notification>") || content.includes(CLEANED_TASK_RESULT)) return false;
+    const cleaned = content.replace(TASK_RESULT_PATTERN, `$1${CLEANED_TASK_RESULT}$2`);
+    if (cleaned !== content) {
+      stats.taskNotifyBytes += byteLen(content) - byteLen(cleaned);
+      stats.taskNotifyCount++;
+      message.content = cleaned;
+      return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+/** origin.body 축소 — 본문이 message.content에 이미 있는 순수 중복 저장분 (peer·task-notification 등).
+ *  kind·from·senderTaskId 같은 메타데이터는 보존한다. */
+function cleanOriginBody(o: Row, stats: CleaningStats): boolean {
+  try {
+    const origin = o?.origin;
+    if (!origin || typeof origin !== "object") return false;
+    const b = origin.body;
+    if (typeof b !== "string" || b.length <= 200 || b.includes("[context-cleaner:")) return false;
+    stats.originBodyBytes += byteLen(b) - byteLen(CLEANED_ORIGIN_BODY);
+    stats.originBodyCount++;
+    origin.body = CLEANED_ORIGIN_BODY;
+    return true;
+  } catch { return false; }
+}
+
+/** peer 메시지의 <agent-message> 내부 축소 — 여닫는 태그·from 속성은 보존 (teammate-message와 동일 방식) */
+function cleanAgentMessage(o: Row, stats: CleaningStats): boolean {
+  try {
+    if (o?.type !== "user") return false;
+    const message = o.message;
+    if (!message || typeof message !== "object") return false;
+    const content = message.content;
+    if (typeof content !== "string" || !content.includes("<agent-message")) return false;
+    const cleaned = content.replace(AGENT_MESSAGE_PATTERN, `$1${CLEANED_AGENT_MESSAGE}$2`);
+    if (cleaned !== content) {
+      stats.agentMessageBytes += byteLen(content) - byteLen(cleaned);
+      stats.agentMessageCount++;
+      message.content = cleaned;
+      return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
 /** sessionId(camelCase)를 새 파일명으로 통일 — session_id(snake)는 건드리지 않는다(라운드2 결정) */
 function updateSessionId(o: Row, newSessionId: string, stats: CleaningStats): boolean {
   if ("sessionId" in o && o.sessionId !== newSessionId) {
@@ -1147,6 +1231,10 @@ function processLine(o: Row, newSessionId: string, stats: CleaningStats, keepHoo
   cleanLocalCommandStdout(o, stats);
   cleanToolUseInputPrompt(o, stats);
   cleanWorkflowScript(o, stats);
+  cleanQueueOperation(o, stats);
+  cleanTaskNotificationResult(o, stats);
+  cleanOriginBody(o, stats);
+  cleanAgentMessage(o, stats);
 }
 
 // ============================================================================
@@ -1228,6 +1316,11 @@ function isSyntheticRow(o: Row): boolean {
  *   즉 "지워도 안전하고 내용도 중복"이지만, 입력이 언제 도달해 언제 소비됐는지의
  *   타이밍은 이 행에만 남는다. 그 기록을 남기는 편을 택했다 → 삭제 규칙을 넣지 않는다.
  *   (다시 논의할 때 이 실측을 재조사하지 말 것. 결정만 바꾸면 된다.)
+ *
+ *   [2026-08-05 추가 결정] 행 삭제는 여전히 안 하지만 content"만" 축소한다(cleanQueueOperation).
+ *   실측(37d93cea, 360행 636KB): queue-operation 53행 189,971B가 파일의 29.9%.
+ *   enqueue 27건 중 23건(85.2%)이 이후 정식 user 행과 본문 중복 → 타이밍 기록(행·
+ *   operation·timestamp)은 보존하고 중복 본문만 마커로 치환. 위 결정과 모순 아님.
  */
 
 // ============================================================================

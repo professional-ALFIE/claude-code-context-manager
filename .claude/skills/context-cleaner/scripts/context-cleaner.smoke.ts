@@ -890,6 +890,190 @@ async function main() {
     assert(res.verify?.ok === true, "내장 무결성 검사 통과");
   });
 
+  // T22 ──────────────────────────────────────────────────────────────
+  // queue-operation은 타이밍 기록 행 자체를 남기고, 200자를 넘는 중복 content만 축소한다.
+  // 경계값 200자는 유지하며, dequeue처럼 content 키가 없는 행도 그대로 둔다.
+  await test("T22 fixture: queue-operation 긴 content만 치환되고 메타·경계값·dequeue는 보존된다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "queueopcontent");
+    const sid = "fixture-queueopcontent-000000000001";
+    const longContent = "<task-notification><result>" + "큐에 중복 저장된 실제 알림 본문 ".repeat(40) + "</result></task-notification>";
+    const boundaryContent = "q".repeat(200);
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "시작" }, uuid: "u-1", timestamp: "2026-08-05T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", timestamp: "2026-08-05T00:00:01.000Z", sessionId: sid, content: longContent }),
+      JSON.stringify({ type: "queue-operation", operation: "remove", timestamp: "2026-08-05T00:00:02.000Z", sessionId: sid, content: boundaryContent }),
+      JSON.stringify({ type: "queue-operation", operation: "dequeue", timestamp: "2026-08-05T00:00:03.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "완료" }] }, uuid: "a-1", timestamp: "2026-08-05T00:00:04.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const queueRows = after.filter((r) => r.o?.type === "queue-operation");
+    const longRow = queueRows.find((r) => r.o?.operation === "enqueue");
+    const boundaryRow = queueRows.find((r) => r.o?.operation === "remove");
+    const dequeueRow = queueRows.find((r) => r.o?.operation === "dequeue");
+
+    // Assert
+    assert(longRow?.o?.content === "[context-cleaner: queue_op]", "200자 초과 content 치환");
+    assert(longRow?.o?.operation === "enqueue", "operation 보존");
+    assert(longRow?.o?.timestamp === "2026-08-05T00:00:01.000Z", "timestamp 보존");
+    assert(longRow?.o?.sessionId === res.newSessionId, "sessionId 필드 보존(사본 ID 치환 규칙만 적용)");
+    assert(boundaryRow?.o?.content === boundaryContent, "200자 content는 원문 유지");
+    assert(!!dequeueRow && !("content" in dequeueRow.o), "content 없는 dequeue 행은 무변화");
+    assert(queueRows.length === 3, "queue-operation 행 3개 모두 보존");
+  });
+
+  // T23 ──────────────────────────────────────────────────────────────
+  // task-notification은 결과 전문만 output-file로 넘겨진 중복이므로 <result> 내부만 줄인다.
+  // 이 규칙에는 길이 문턱이 없어 200자 경계의 result도 같은 방식으로 축소한다.
+  await test("T23 fixture: task-notification의 긴·200자 result 내부만 치환되고 껍데기는 보존된다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "tasknotifyresult");
+    const sid = "fixture-tasknotify-0000000000001";
+    const longResult = "서브에이전트가 작성한 실제 조사 결과 문단입니다. ".repeat(40);
+    const boundaryResult = "결".repeat(200);
+    const notification = (taskId: string, result: string) =>
+      "<task-notification>\n" +
+      `<task-id>${taskId}</task-id>\n` +
+      `<output-file>/Users/nsk_intel_mac/.claude/tasks/${taskId}/output.txt</output-file>\n` +
+      "<status>completed</status>\n" +
+      "<summary>조사 완료</summary>\n" +
+      `<result>${result}</result>\n` +
+      "</task-notification>";
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "조사 시작" }, uuid: "u-1", timestamp: "2026-08-05T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "user", origin: { kind: "task-notification" }, message: { role: "user", content: notification("task-long", longResult) }, uuid: "u-2", timestamp: "2026-08-05T00:00:01.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-2", type: "user", origin: { kind: "task-notification" }, message: { role: "user", content: notification("task-boundary", boundaryResult) }, uuid: "u-3", timestamp: "2026-08-05T00:00:02.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-3", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "확인" }] }, uuid: "a-1", timestamp: "2026-08-05T00:00:03.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const longContent = String(after.find((r) => r.o?.uuid === "u-2")?.o?.message?.content);
+    const boundaryContent = String(after.find((r) => r.o?.uuid === "u-3")?.o?.message?.content);
+
+    // Assert
+    assert(longContent.includes("<result>[context-cleaner: task_result]</result>"), "긴 result 내부 치환 + 여닫는 태그 보존");
+    assert(boundaryContent.includes("<result>[context-cleaner: task_result]</result>"), "200자 result도 동일하게 치환");
+    for (const [label, content, taskId] of [["긴 행", longContent, "task-long"], ["경계 행", boundaryContent, "task-boundary"]] as const) {
+      assert(content.includes(`<task-id>${taskId}</task-id>`), `${label}: task-id와 값 보존`);
+      assert(content.includes(`<output-file>/Users/nsk_intel_mac/.claude/tasks/${taskId}/output.txt</output-file>`), `${label}: output-file과 값 보존`);
+      assert(content.includes("<status>completed</status>"), `${label}: status와 값 보존`);
+      assert(content.includes("<summary>조사 완료</summary>"), `${label}: summary와 값 보존`);
+      assert(content.startsWith("<task-notification>") && content.endsWith("</task-notification>"), `${label}: task-notification 껍데기 보존`);
+    }
+  });
+
+  // T24 ──────────────────────────────────────────────────────────────
+  await test("T24 fixture: origin.body는 200자 초과만 치환되고 kind·from과 경계값은 보존된다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "originbody");
+    const sid = "fixture-originbody-000000000000001";
+    const longBody = "peer가 보낸 원본 메시지 본문과 메타데이터 중 중복 저장된 부분 ".repeat(40);
+    const boundaryBody = "b".repeat(200);
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", origin: { kind: "peer", from: "researcher", body: longBody }, message: { role: "user", content: "전달된 메시지" }, uuid: "u-1", timestamp: "2026-08-05T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "user", origin: { kind: "peer", from: "reviewer", body: boundaryBody }, message: { role: "user", content: "짧은 전달 메시지" }, uuid: "u-2", timestamp: "2026-08-05T00:00:01.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-2", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "확인" }] }, uuid: "a-1", timestamp: "2026-08-05T00:00:02.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const longOrigin = after.find((r) => r.o?.uuid === "u-1")?.o?.origin;
+    const boundaryOrigin = after.find((r) => r.o?.uuid === "u-2")?.o?.origin;
+
+    // Assert
+    assert(longOrigin?.body === "[context-cleaner: origin_body]", "200자 초과 origin.body 치환");
+    assert(longOrigin?.kind === "peer", "origin.kind 보존");
+    assert(longOrigin?.from === "researcher", "origin.from 보존");
+    assert(boundaryOrigin?.body === boundaryBody, "200자 origin.body는 원문 유지");
+    assert(boundaryOrigin?.kind === "peer" && boundaryOrigin?.from === "reviewer", "경계 행의 다른 origin 필드 보존");
+  });
+
+  // T25 ──────────────────────────────────────────────────────────────
+  // agent-message도 길이 문턱 없이 태그 내부만 줄이므로 200자 경계 입력을 함께 고정한다.
+  await test("T25 fixture: agent-message의 긴·200자 내부만 치환되고 from 속성·태그는 보존된다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "agentmessage");
+    const sid = "fixture-agentmessage-00000000000001";
+    const longBody = "서브에이전트가 메인 에이전트에 전달한 상세 분석 결과와 근거 문장 ".repeat(40);
+    const boundaryBody = "에".repeat(200);
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: `<agent-message from="researcher">${longBody}</agent-message>` }, uuid: "u-1", timestamp: "2026-08-05T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-1", type: "user", message: { role: "user", content: `<agent-message from="reviewer">${boundaryBody}</agent-message>` }, uuid: "u-2", timestamp: "2026-08-05T00:00:01.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-2", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "수신" }] }, uuid: "a-1", timestamp: "2026-08-05T00:00:02.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const longContent = after.find((r) => r.o?.uuid === "u-1")?.o?.message?.content;
+    const boundaryContent = after.find((r) => r.o?.uuid === "u-2")?.o?.message?.content;
+
+    // Assert
+    assert(longContent === '<agent-message from="researcher">[context-cleaner: agent_message]</agent-message>', "긴 내부 치환 + researcher 속성·태그 보존");
+    assert(boundaryContent === '<agent-message from="reviewer">[context-cleaner: agent_message]</agent-message>', "200자 내부 치환 + reviewer 속성·태그 보존");
+  });
+
+  // T26 ──────────────────────────────────────────────────────────────
+  // 네 신규 규칙을 한 transcript에 섞어 전체 파싱→치환→직렬화→무결성 검사를 통과시킨다.
+  await test("T26 통합 fixture: 신규 축소 규칙 4종 혼합 후 uuid 체인 고아 0·내장 무결성 통과", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "fourrules");
+    const sid = "fixture-fourrules-0000000000000001";
+    const queueBody = "정식 user 행에도 들어가는 queue-operation 중복 알림 본문 ".repeat(40);
+    const taskResult = "작업 완료 알림에 포함된 상세 결과 전문과 진단 자료 ".repeat(40);
+    const taskNotification =
+      "<task-notification><task-id>task-integrated</task-id>" +
+      "<output-file>/Users/nsk_intel_mac/.claude/tasks/task-integrated/output.txt</output-file>" +
+      "<status>completed</status><summary>통합 작업 완료</summary>" +
+      `<result>${taskResult}</result></task-notification>`;
+    const agentBody = "peer 서브에이전트가 전달한 상세 메시지와 조사 근거 ".repeat(40);
+    writeFileSync(F, [
+      JSON.stringify({ parentUuid: null, type: "user", message: { role: "user", content: "통합 시작" }, uuid: "u-root", timestamp: "2026-08-05T00:00:00.000Z", sessionId: sid }),
+      JSON.stringify({ type: "queue-operation", operation: "enqueue", content: queueBody, timestamp: "2026-08-05T00:00:01.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-root", type: "user", origin: { kind: "task-notification", from: "task-runner", body: taskNotification }, message: { role: "user", content: taskNotification }, uuid: "u-task", timestamp: "2026-08-05T00:00:02.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-task", type: "user", origin: { kind: "peer", from: "researcher" }, message: { role: "user", content: `<agent-message from="researcher">${agentBody}</agent-message>` }, uuid: "u-agent", timestamp: "2026-08-05T00:00:03.000Z", sessionId: sid }),
+      JSON.stringify({ parentUuid: "u-agent", type: "assistant", message: { role: "assistant", content: [{ type: "text", text: "통합 완료" }] }, uuid: "a-final", timestamp: "2026-08-05T00:00:04.000Z", sessionId: sid }),
+      JSON.stringify({ type: "last-prompt", leafUuid: "u-agent", timestamp: "2026-08-05T00:00:05.000Z", sessionId: sid }),
+    ].join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const taskRow = after.find((r) => r.o?.uuid === "u-task");
+    const agentRow = after.find((r) => r.o?.uuid === "u-agent");
+
+    // Assert
+    assert(after.find((r) => r.o?.type === "queue-operation")?.o?.content === "[context-cleaner: queue_op]", "queue-operation content 치환");
+    assert(String(taskRow?.o?.message?.content).includes("<result>[context-cleaner: task_result]</result>"), "task-notification result 치환");
+    assert(taskRow?.o?.origin?.body === "[context-cleaner: origin_body]", "origin.body 치환");
+    assert(agentRow?.o?.message?.content === '<agent-message from="researcher">[context-cleaner: agent_message]</agent-message>', "agent-message 내부 치환");
+    const us = uuidSet(after);
+    const orphans = after.filter((r) => r.o?.parentUuid && !us.has(r.o.parentUuid));
+    assert(orphans.length === 0, `고아 parentUuid 0개 (실제 ${orphans.length}개)`);
+    assert(res.verify?.ok === true, `내장 무결성 검사 통과 (${JSON.stringify(res.verify?.summary?.output ?? {})})`);
+  });
+
   // ── 정리 (§8: 회귀 분석을 위해 보존이 기본) ──
   if (process.env.CLEAN_ARTIFACTS === "1") {
     for (const a of artifacts) if (existsSync(a)) unlinkSync(a);
