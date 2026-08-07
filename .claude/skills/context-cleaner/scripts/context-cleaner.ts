@@ -201,6 +201,30 @@ const TASK_RESULT_PATTERN = /(<result>)[\s\S]*?(<\/result>)/g;
 const AGENT_MESSAGE_PATTERN = /(<agent-message[^>]*>)[\s\S]*?(<\/agent-message>)/g;
 
 // ============================================================================
+// Claude transcript의 일반 도구 호출 관계 (실물 transcript 대조로 확인)
+//
+// 1. 요청은 assistant 행의 message.content[] 안에 있는 tool_use 블록이다.
+//    - tool_use.id: 호출 ID
+//    - tool_use.name: Bash, Read, Edit, MCP 등의 도구명
+//    - tool_use.input: 도구에 전달한 입력
+//
+// 2. 모델에게 전달되는 결과는 user 행의 message.content[] 안에 있는 tool_result 블록이다.
+//    - tool_result.tool_use_id === 대응하는 tool_use.id
+//    - tool_result.content: 문자열 또는 content block 배열 형태의 결과 표현
+//
+// 3. 같은 user 결과 행의 최상위 toolUseResult는 도구별 구조화 결과다.
+//    tool_result.content와 관련되지만 동일한 복사본이라고 가정하면 안 된다.
+//    큰 Bash 출력은 persisted-output 안내문과 실제 stdout이 갈릴 수 있고,
+//    MCP 결과에는 추가 _meta가 붙을 수 있으며, 도구에 따라 object/array/string 모두 가능하다.
+//
+// 4. 결과 행의 parentUuid와 sourceToolAssistantUUID는 대응하는 assistant tool_use 행의
+//    uuid를 가리킨다. 다만 호출과 결과의 최종 연결 기준은 아래 ID 일치다.
+//    tool_use.id === tool_result.tool_use_id
+//
+// 5. 다른 호출·결과·메타데이터 행이 사이에 들어갈 수 있으므로 행 인접성으로 연결하지 않는다.
+//    message.content[]에는 text와 tool_use 같은 다른 블록이 섞일 수 있으므로 특정 도구만
+//    제거할 때는 배열 전체를 순회해 대상 블록만 제거하고, 배열이 비었을 때만 행을 삭제한다.
+//
 // zod 상위 계약 — "우리가 읽고 분기하는 필드"의 의미 고정
 // 심층 구조(message/attachment/data/toolUseResult)는 형태 다양성이 커서 스키마로 고정하면
 // 미래 형식에서 클리닝이 통째로 스킵되는 역효과가 있다 → v4와 동일한 방어적 접근 유지.
