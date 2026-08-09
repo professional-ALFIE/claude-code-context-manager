@@ -52,7 +52,7 @@ Strips bulky data from `.jsonl` transcript files:
 - Hook progress, hook summaries and hook attachments; synthetic/local-command rows; tool result duplicates; meta content
 
 Preserves: conversation text, edit intent, UUID chains, resume anchors, branch tips,
-**bash commands (verbatim)**, and **full file paths**.
+the reproducible **first and last Bash commands in each user-prompt group**, and **full file paths**.
 
 > **Changed in 2026-07 — commands and paths are now kept.**
 > Previously `input.command` was replaced and full paths were trimmed to filenames.
@@ -62,7 +62,7 @@ Preserves: conversation text, edit intent, UUID chains, resume anchors, branch t
 > Reduction stayed at **68.8%** either way, so keeping them is nearly free.
 > Filenames alone cannot disambiguate same-named files (e.g. two different `CLAUDE.md`),
 > and option/regex/field-offset trial-and-error inside a command is not recoverable from a summary.
-> Both behaviours are **one comment away** from returning — see [Reverting](#reverting-keep-vs-strip).
+> Full-path preservation and subagent Bash command handling remain comment-controlled. Main-conversation Bash now follows the per-user-prompt grouping policy below — see [Reverting](#reverting-keep-vs-strip).
 
 > **Changed in 2026-07-31 — base64 images and `attachment.snippet`.**
 > Tool-returned screenshots are stored in *two* places: nested inside
@@ -131,9 +131,32 @@ Editing records old/new strings and the original file.
 
 #### Bash
 
-Running a command records the command text and its full output.
+Running a command records the command text and its full output. The cleaner groups main-chain Bash calls from one actual user prompt up to the next actual user prompt.
 
-- **Call**: `input.command` → **kept (verbatim)**
+```yaml
+One_Bash_call:
+  call: keep input.command verbatim
+  result: replace with existing markers
+Two_Bash_calls:
+  calls: keep both input.command values verbatim
+  results: replace both with existing markers
+Three_or_more_Bash_calls:
+  first_call: keep input.command verbatim
+  middle_calls: remove tool_use and tool_result pairs whose ID links are complete
+  last_call: keep input.command verbatim
+  retained_results: replace with existing markers
+Ambiguous_group:
+  row_deletion: none
+  every_Bash_input_and_result: replace with existing markers
+Sidechain:
+  handling: exclude from counts and middle-call removal; keep existing behavior
+Background:
+  middle_call: also remove the completion notification with the same tool-use-id
+```
+
+- Calls and results are linked by `tool_use.id === tool_result.tool_use_id`, never by row adjacency.
+- In mixed `message.content[]`, only the target Bash block is removed. A row is deleted only when no content blocks remain.
+- If a middle call has a missing or duplicate ID, missing or duplicate results, ambiguous structured-result ownership, or an ambiguous background notification link, the whole group uses the safe replacement fallback.
 - **Result**: `toolUseResult.stdout`, `.stderr` → replaced
 - **Progress**: `data.output`, `data.fullOutput` (bash_progress lines) → replaced
 - **Result duplicate**: `tool_result.content` → replaced
@@ -204,16 +227,13 @@ After cleaning, you get a detailed report:
 
 ### Reverting: keep vs strip
 
-Keeping bash commands and full paths is a **default, not a hard rule**. Each behaviour is
-disabled by a comment block in `scripts/context-cleaner.ts` — uncomment to strip them again.
-No other edits are needed.
+Keeping full paths and subagent Bash commands is a **default, not a hard rule**. Those behaviors remain disabled by comment blocks in `scripts/context-cleaner.ts`.
 
-**To strip bash commands** (uncomment 2 places):
+Main-conversation Bash commands are no longer controlled by a single commented function call. They are part of the per-user-prompt group policy. To change that policy, update the `preserve-inputs`, `remove-middle`, and `replace-all-bash` decisions in `buildBashCleaningPlan()` together, then run Integration tests T27–T31 to verify reference integrity and ambiguous-group fallback behavior.
 
-| Location | Line |
-|---|---|
-| `processLine()` | `// cleanBashInput(o, stats);` |
-| `cleanAgentProgress()` | the commented `input.command` block (subagent bash) |
+**To strip subagent Bash commands**:
+
+- Uncomment the `input.command` block in `cleanAgentProgress()`.
 
 **To strip full file paths** (uncomment 5 places):
 
@@ -226,9 +246,8 @@ No other edits are needed.
 | `cleanEditResult()` | commented `filePath` block |
 
 Notes:
-- `cleanBashInput()` and `cleanInputFilepath()` are **kept in the source** (only their calls are
-  disabled) so that reverting is a one-line change. Consequently the `Bash inputs` and `Filenames`
-  counters read `0` in this configuration — that is expected, not a bug.
+- `cleanBashInput()` is used by the safe fallback for ambiguous Bash groups, so the `Bash inputs` counter increases when such a group is encountered.
+- `cleanInputFilepath()` remains in the source with its call disabled, so a `Filenames` count of `0` is expected.
 - `row.cwd` was never touched; it is the source for the `cd` target in the resume command.
 - System prompts are **not** recorded in the transcript at all, so there is nothing to strip there.
 

@@ -1074,6 +1074,309 @@ async function main() {
     assert(res.verify?.ok === true, `내장 무결성 검사 통과 (${JSON.stringify(res.verify?.summary?.output ?? {})})`);
   });
 
+  // T27 ──────────────────────────────────────────────────────────────
+  await test("T27 Bash 묶음: 1·2개는 전부 보존하고 3·10개는 첫·마지막만 남긴다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "bash-boundaries");
+    const sid = "fixture-bash-boundaries-0000000001";
+    const fixtureRows: any[] = [];
+    let parent: string | null = null;
+    let clock = 0;
+    const add = (row: any) => {
+      const withCommon = {
+        ...row,
+        ...(row.uuid ? { parentUuid: row.parentUuid === undefined ? parent : row.parentUuid } : {}),
+        timestamp: `2026-08-09T00:00:${String(clock++).padStart(2, "0")}.000Z`,
+        sessionId: sid,
+      };
+      fixtureRows.push(withCommon);
+      if (withCommon.uuid) parent = withCommon.uuid;
+      return withCommon;
+    };
+    const prompt = (name: string) => add({ type: "user", uuid: `u-${name}`, message: { role: "user", content: `${name} 실행` } });
+    const bash = (group: string, index: number, sidechain = false) => {
+      const id = `bash-${group}-${index}`;
+      const assistantUuid = `a-${group}-${index}`;
+      add({
+        type: "assistant",
+        uuid: assistantUuid,
+        ...(sidechain ? { isSidechain: true } : {}),
+        message: { role: "assistant", content: [{ type: "tool_use", id, name: "Bash", input: { command: `printf '${group}-${index}'`, description: `${group} ${index}` } }] },
+      });
+      add({
+        type: "user",
+        uuid: `r-${group}-${index}`,
+        ...(sidechain ? { isSidechain: true } : {}),
+        sourceToolAssistantUUID: assistantUuid,
+        message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: `result-${group}-${index}` }] },
+        toolUseResult: { stdout: `stdout-${group}-${index}`, stderr: "", interrupted: false },
+      });
+    };
+    const group = (name: string, count: number, options?: { notificationAfterFirst?: boolean; sidechainAfterFirst?: boolean; readAfterFirst?: boolean }) => {
+      prompt(name);
+      for (let i = 1; i <= count; i++) {
+        bash(name, i);
+        if (i === 1 && options?.notificationAfterFirst) {
+          add({
+            type: "user",
+            uuid: `n-${name}`,
+            promptSource: "system",
+            origin: { kind: "task-notification" },
+            message: { role: "user", content: "<task-notification><task-id>other-task</task-id><result>알림 결과</result></task-notification>" },
+          });
+        }
+        if (i === 1 && options?.sidechainAfterFirst) bash(name, 99, true);
+        if (i === 1 && options?.readAfterFirst) {
+          const readId = `read-${name}`;
+          const readAssistant = `a-read-${name}`;
+          add({ type: "assistant", uuid: readAssistant, message: { role: "assistant", content: [{ type: "tool_use", id: readId, name: "Read", input: { file_path: "/repo/file.ts" } }] } });
+          add({ type: "user", uuid: `r-read-${name}`, sourceToolAssistantUUID: readAssistant, message: { role: "user", content: [{ type: "tool_result", tool_use_id: readId, content: "file body" }] }, toolUseResult: { file: { filePath: "/repo/file.ts", content: "file body" } } });
+        }
+      }
+    };
+    group("one", 1);
+    group("two", 2);
+    group("three", 3, { notificationAfterFirst: true, sidechainAfterFirst: true });
+    group("ten", 10, { readAfterFirst: true });
+    writeFileSync(F, fixtureRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const bashBlocks = after.flatMap((r) => Array.isArray(r.o?.message?.content) ? r.o.message.content.filter((b: any) => b?.type === "tool_use" && b?.name === "Bash") : []);
+    const bashIds = new Set(bashBlocks.map((b: any) => b.id));
+
+    // Assert
+    assert(bashIds.has("bash-one-1"), "Bash 1개 묶음의 호출 보존");
+    assert(bashIds.has("bash-two-1") && bashIds.has("bash-two-2"), "Bash 2개 묶음의 두 호출 보존");
+    assert(bashIds.has("bash-three-1") && bashIds.has("bash-three-3") && !bashIds.has("bash-three-2"), "Bash 3개 묶음은 첫·마지막만 보존");
+    assert(bashIds.has("bash-three-99"), "sidechain Bash는 main-chain 개수와 제거 대상에서 제외");
+    const tenIds = [...bashIds].filter((id) => String(id).startsWith("bash-ten-"));
+    assert(tenIds.length === 2 && tenIds.includes("bash-ten-1") && tenIds.includes("bash-ten-10"), `Bash 10개 묶음은 첫·마지막 2개만 보존 (실제 ${tenIds.join(",")})`);
+    assert(after.some((r) => r.o?.uuid === "a-read-ten") && after.some((r) => r.o?.uuid === "r-read-ten"), "Bash 사이의 다른 도구 호출·결과 보존");
+    const preservedCommands = new Map(bashBlocks.map((b: any) => [b.id, b.input?.command]));
+    for (const id of ["bash-one-1", "bash-two-1", "bash-two-2", "bash-three-1", "bash-three-3", "bash-ten-1", "bash-ten-10", "bash-three-99"])
+      assert(preservedCommands.get(id) === `printf '${String(id).replace(/^bash-/, "").replace(/-(\d+)$/, "-$1")}'`.replace("three-99", "three-99"), `${id} input.command 전문 보존`);
+    const remainingBashResults = after.flatMap((r) => Array.isArray(r.o?.message?.content) ? r.o.message.content.filter((b: any) => b?.type === "tool_result" && bashIds.has(b.tool_use_id)) : []);
+    assert(remainingBashResults.every((b: any) => b.content === "[context-cleaner: tool_result]"), "보존된 Bash 결과 content 전부 정리");
+    assert(!after.some((r) => Array.isArray(r.o?.message?.content) && r.o.message.content.some((b: any) => b?.type === "tool_result" && ["bash-three-2", ...Array.from({ length: 8 }, (_, i) => `bash-ten-${i + 2}`)].includes(b.tool_use_id))), "중간 Bash tool_result 전부 제거");
+    assert(after.some((r) => r.o?.uuid === "n-three"), "task-notification이 사용자 묶음을 끊지 않고 행은 보존");
+    assert(res.verify?.ok === true, `내장 무결성 검사 통과 (${JSON.stringify(res.verify?.problems)})`);
+  });
+
+  // T28 ──────────────────────────────────────────────────────────────
+  await test("T28 혼합·background Bash: 중간 블록만 제거하고 완료 알림과 참조를 함께 정리한다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "bash-mixed-background");
+    const sid = "fixture-bash-mixed-background-001";
+    const notification = "<task-notification><task-id>bg-task-1</task-id><tool-use-id>bash-bg</tool-use-id><status>completed</status><result>background output</result></task-notification>";
+    const fixtureRows = [
+      { parentUuid: null, type: "user", uuid: "u-root", message: { role: "user", content: "네 번 실행" }, sessionId: sid },
+      { parentUuid: "u-root", type: "assistant", uuid: "a-first", message: { role: "assistant", content: [{ type: "tool_use", id: "bash-first", name: "Bash", input: { command: "first", timeout: 1000 } }] }, sessionId: sid },
+      { parentUuid: "a-first", type: "user", uuid: "r-first", sourceToolAssistantUUID: "a-first", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "bash-first", content: "first result" }] }, toolUseResult: { stdout: "first stdout", stderr: "" }, sessionId: sid },
+      { parentUuid: "r-first", type: "assistant", uuid: "a-mixed", message: { role: "assistant", content: [{ type: "text", text: "중간 설명" }, { type: "tool_use", id: "bash-mixed", name: "Bash", input: { command: "middle", description: "mixed" } }] }, sessionId: sid },
+      { parentUuid: "a-mixed", type: "user", uuid: "r-mixed", sourceToolAssistantUUID: "a-mixed", message: { role: "user", content: [{ type: "text", text: "결과 메모" }, { type: "tool_result", tool_use_id: "bash-mixed", content: "middle result" }] }, toolUseResult: { stdout: "middle stdout", stderr: "middle stderr" }, sessionId: sid },
+      { parentUuid: "r-mixed", type: "assistant", uuid: "a-bg", message: { role: "assistant", content: [{ type: "tool_use", id: "bash-bg", name: "Bash", input: { command: "background", run_in_background: true } }] }, sessionId: sid },
+      { parentUuid: "a-bg", type: "user", uuid: "r-bg", sourceToolAssistantUUID: "a-bg", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "bash-bg", content: "background launched" }] }, toolUseResult: { backgroundTaskId: "bg-task-1", stdout: "launched", stderr: "", interrupted: false }, sessionId: sid },
+      { parentUuid: "r-bg", type: "user", uuid: "n-bg", promptSource: "system", origin: { kind: "task-notification" }, message: { role: "user", content: notification }, sessionId: sid },
+      { type: "file-history-snapshot", messageId: "r-bg", snapshot: { trackedFileBackups: {} }, sessionId: sid },
+      { parentUuid: "n-bg", type: "assistant", uuid: "a-last", message: { role: "assistant", content: [{ type: "tool_use", id: "bash-last", name: "Bash", input: { command: "last", description: "last" } }] }, sessionId: sid },
+      { parentUuid: "a-last", type: "user", uuid: "r-last", sourceToolAssistantUUID: "a-last", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "bash-last", content: "last result" }] }, toolUseResult: { stdout: "last stdout", stderr: "" }, sessionId: sid },
+      { type: "last-prompt", leafUuid: "n-bg", sessionId: sid },
+    ];
+    writeFileSync(F, fixtureRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const aMixed = after.find((r) => r.o?.uuid === "a-mixed")?.o;
+    const rMixed = after.find((r) => r.o?.uuid === "r-mixed")?.o;
+    const aLast = after.find((r) => r.o?.uuid === "a-last")?.o;
+    const lastPrompt = after.find((r) => r.o?.type === "last-prompt")?.o;
+
+    // Assert
+    assert(aMixed?.message?.content?.length === 1 && aMixed.message.content[0]?.text === "중간 설명", "text + 중간 tool_use에서 Bash 블록만 제거");
+    assert(rMixed?.message?.content?.length === 1 && rMixed.message.content[0]?.text === "결과 메모", "text + 중간 tool_result에서 Bash 결과 블록만 제거");
+    assert(!("toolUseResult" in (rMixed ?? {})), "혼합 결과 행의 대응 최상위 toolUseResult 제거");
+    assert(!("sourceToolAssistantUUID" in (rMixed ?? {})), "tool_result가 사라진 혼합 행의 sourceToolAssistantUUID 제거");
+    assert(!after.some((r) => ["a-bg", "r-bg", "n-bg"].includes(r.o?.uuid)), "중간 background 호출·직접 결과·완료 알림 행 함께 제거");
+    assert(!after.some((r) => r.o?.type === "file-history-snapshot" && r.o?.messageId === "r-bg"), "삭제된 결과를 가리킨 snapshot 행 제거");
+    assert(aLast?.parentUuid === "r-mixed", `연속 삭제 행을 건너 a-last.parentUuid 재연결 (실제 ${aLast?.parentUuid})`);
+    assert(lastPrompt?.leafUuid === "r-mixed", `last-prompt.leafUuid를 생존 조상으로 재연결 (실제 ${lastPrompt?.leafUuid})`);
+    assert(res.stats?.bashMiddleToolUseRemoved === 2, `중간 tool_use 2개 통계 (실제 ${res.stats?.bashMiddleToolUseRemoved})`);
+    assert(res.stats?.bashBackgroundNotificationsRemoved === 1, `background 완료 알림 1개 통계 (실제 ${res.stats?.bashBackgroundNotificationsRemoved})`);
+    assert(res.verify?.ok === true, `내장 무결성 검사 통과 (${JSON.stringify(res.verify?.problems)})`);
+  });
+
+  // T29 ──────────────────────────────────────────────────────────────
+  await test("T29 모호한 Bash 묶음: 원인별로 행 삭제 없이 모든 입력·결과를 대체 처리한다", async () => {
+    const cases = ["missing-id", "duplicate-id", "missing-result", "duplicate-result", "owner-unknown", "notification-ambiguous"] as const;
+    for (const kind of cases) {
+      // Arrange
+      const F = FIXTURE.replace("malformed", `bash-fallback-${kind}`);
+      const sid = `fixture-bash-fallback-${kind}`;
+      const fixtureRows: any[] = [];
+      let parent: string | null = null;
+      let serial = 0;
+      const add = (row: any) => {
+        const uuid = row.uuid ?? `${kind}-row-${serial++}`;
+        const withCommon = { ...row, uuid, parentUuid: row.parentUuid === undefined ? parent : row.parentUuid, sessionId: sid };
+        fixtureRows.push(withCommon);
+        parent = uuid;
+        return withCommon;
+      };
+      const promptRow = add({ type: "user", uuid: `${kind}-prompt`, message: { role: "user", content: "세 번 실행" } });
+      void promptRow;
+      const addCall = (label: string, id: string | undefined, resultCount = 1, backgroundTaskId?: string) => {
+        const assistantUuid = `${kind}-a-${label}`;
+        const block: any = { type: "tool_use", name: "Bash", input: { command: `${kind}-${label}`, description: label } };
+        if (id !== undefined) block.id = id;
+        add({ type: "assistant", uuid: assistantUuid, message: { role: "assistant", content: [block] } });
+        if (id !== undefined) {
+          for (let n = 0; n < resultCount; n++) add({
+            type: "user",
+            uuid: `${kind}-r-${label}-${n}`,
+            sourceToolAssistantUUID: assistantUuid,
+            message: { role: "user", content: [{ type: "tool_result", tool_use_id: id, content: `${kind}-${label}-result-${n}` }] },
+            toolUseResult: { ...(backgroundTaskId ? { backgroundTaskId } : {}), stdout: `${kind}-${label}-stdout-${n}`, stderr: "" },
+          });
+        }
+      };
+      addCall("first", `${kind}-first`);
+      if (kind === "missing-id") addCall("middle", undefined, 0);
+      else if (kind === "duplicate-id") {
+        addCall("middle-a", `${kind}-dup`);
+        addCall("middle-b", `${kind}-dup`);
+      } else if (kind === "missing-result") addCall("middle", `${kind}-middle`, 0);
+      else if (kind === "duplicate-result") addCall("middle", `${kind}-middle`, 2);
+      else if (kind === "owner-unknown") {
+        const bashAssistant = `${kind}-a-middle`;
+        add({ type: "assistant", uuid: bashAssistant, message: { role: "assistant", content: [{ type: "tool_use", id: `${kind}-middle`, name: "Bash", input: { command: `${kind}-middle` } }] } });
+        const readAssistant = `${kind}-a-read`;
+        add({ type: "assistant", uuid: readAssistant, message: { role: "assistant", content: [{ type: "tool_use", id: `${kind}-read`, name: "Read", input: { file_path: "/repo/file.ts" } }] } });
+        add({
+          type: "user",
+          uuid: `${kind}-r-mixed`,
+          sourceToolAssistantUUID: bashAssistant,
+          message: { role: "user", content: [
+            { type: "tool_result", tool_use_id: `${kind}-middle`, content: "bash result" },
+            { type: "tool_result", tool_use_id: `${kind}-read`, content: "read result" },
+          ] },
+          toolUseResult: { stdout: "ambiguous stdout", stderr: "" },
+        });
+      } else {
+        addCall("middle", `${kind}-middle`, 1, `${kind}-task`);
+        add({
+          type: "user",
+          uuid: `${kind}-notification`,
+          promptSource: "system",
+          origin: { kind: "task-notification" },
+          message: { role: "user", content: `<task-notification><task-id>${kind}-task</task-id><status>completed</status><result>done</result></task-notification>` },
+        });
+      }
+      addCall("last", `${kind}-last`);
+      const originalRowCount = fixtureRows.length;
+      writeFileSync(F, fixtureRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+      // Act
+      const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+      assert(res.ok === true, `${kind}: 클리닝 성공`);
+      if (!res.outputPath) continue;
+      artifacts.push(res.outputPath);
+      const after = rows(res.outputPath);
+      const bashCalls = after.flatMap((r) => Array.isArray(r.o?.message?.content) ? r.o.message.content.filter((b: any) => b?.type === "tool_use" && b?.name === "Bash") : []);
+      const bashIds = new Set(bashCalls.map((b: any) => b.id).filter(Boolean));
+      const bashResults = after.flatMap((r) => Array.isArray(r.o?.message?.content) ? r.o.message.content.filter((b: any) => b?.type === "tool_result" && bashIds.has(b.tool_use_id)) : []);
+
+      // Assert
+      assert(after.length === originalRowCount, `${kind}: 행 삭제 없음 (${originalRowCount}개 보존)`);
+      assert(bashCalls.every((b: any) => b.input?.command === "[context-cleaner: Bash]"), `${kind}: 모든 Bash input.command 대체 처리`);
+      assert(bashResults.every((b: any) => b.content === "[context-cleaner: tool_result]"), `${kind}: 연결 가능한 Bash tool_result.content 대체 처리`);
+      assert(after.filter((r) => r.o?.toolUseResult && typeof r.o.toolUseResult === "object" && ("stdout" in r.o.toolUseResult || "stderr" in r.o.toolUseResult)).every((r) => [r.o.toolUseResult.stdout, r.o.toolUseResult.stderr].every((v: any) => !v || v === "[context-cleaner: Bash]")), `${kind}: 구조화 stdout·stderr 대체 처리`);
+      if (kind === "notification-ambiguous") {
+        const nc = String(after.find((r) => r.o?.uuid === `${kind}-notification`)?.o?.message?.content);
+        assert(nc.includes("<result>[context-cleaner: task_result]</result>"), `${kind}: 완료 알림 result만 기존 방식으로 정리`);
+      }
+      assert(res.stats?.bashFallbackGroups === 1, `${kind}: 대체 처리 묶음 1개 통계 (실제 ${res.stats?.bashFallbackGroups})`);
+      assert((res.stats?.bashFallbackReasons?.get?.(kind) ?? 0) === 1, `${kind}: 원인별 통계 기록`);
+      assert(res.verify?.ok === true, `${kind}: 내장 무결성 검사 통과 (${JSON.stringify(res.verify?.problems)})`);
+    }
+  });
+
+  // T30 ──────────────────────────────────────────────────────────────
+  await test("T30 Bash 묶음 정리 재실행: 추가 삭제·참조 변경·placeholder 변형이 없다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "bash-idempotent");
+    const sid = "fixture-bash-idempotent-00000000001";
+    const fixtureRows: any[] = [{ parentUuid: null, type: "user", uuid: "u-root", message: { role: "user", content: "열 번 실행" }, sessionId: sid }];
+    let parent = "u-root";
+    for (let i = 1; i <= 10; i++) {
+      const assistantUuid = `a-${i}`;
+      const resultUuid = `r-${i}`;
+      fixtureRows.push({ parentUuid: parent, type: "assistant", uuid: assistantUuid, message: { role: "assistant", content: [{ type: "tool_use", id: `bash-${i}`, name: "Bash", input: { command: `command-${i}`, timeout: i * 100 } }] }, sessionId: sid });
+      fixtureRows.push({ parentUuid: assistantUuid, type: "user", uuid: resultUuid, sourceToolAssistantUUID: assistantUuid, message: { role: "user", content: [{ type: "tool_result", tool_use_id: `bash-${i}`, content: `result-${i}` }] }, toolUseResult: { stdout: `stdout-${i}`, stderr: "" }, sessionId: sid });
+      parent = resultUuid;
+    }
+    writeFileSync(F, fixtureRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    const first = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(first.ok === true && !!first.outputPath, "첫 번째 클리닝 성공");
+    if (!first.outputPath) return;
+    artifacts.push(first.outputPath);
+    const hashAfterFirst = sha(first.outputPath);
+    const rowCountAfterFirst = rows(first.outputPath).length;
+
+    // Act
+    const second = await cleanTranscript(first.outputPath, { hooks: parseHooksFlag(undefined), mode: "inplace" });
+
+    // Assert
+    assert(second.ok === true, "두 번째 in-place 클리닝 성공");
+    assert(sha(first.outputPath) === hashAfterFirst, "두 번째 실행 후 출력 바이트 불변");
+    assert(rows(first.outputPath).length === rowCountAfterFirst, "두 번째 실행에서 추가 행 삭제 없음");
+    const after = rows(first.outputPath);
+    const ids = after.flatMap((r) => Array.isArray(r.o?.message?.content) ? r.o.message.content.filter((b: any) => b?.type === "tool_use" && b?.name === "Bash").map((b: any) => b.id) : []);
+    assert(ids.length === 2 && ids[0] === "bash-1" && ids[1] === "bash-10", `첫·마지막 두 호출 유지 (실제 ${ids.join(",")})`);
+    assert(second.verify?.ok === true, `두 번째 실행 무결성 검사 통과 (${JSON.stringify(second.verify?.problems)})`);
+  });
+
+  // T31 ──────────────────────────────────────────────────────────────
+  await test("T31 Bash ID가 다른 도구와 중복되면 삭제하지 않고 묶음 전체를 대체 처리한다", async () => {
+    // Arrange
+    const F = FIXTURE.replace("malformed", "bash-cross-tool-duplicate");
+    const sid = "fixture-bash-cross-tool-duplicate-001";
+    const fixtureRows = [
+      { parentUuid: null, type: "user", uuid: "u-root", message: { role: "user", content: "세 번 실행" }, sessionId: sid },
+      { parentUuid: "u-root", type: "assistant", uuid: "a-first", message: { role: "assistant", content: [{ type: "tool_use", id: "bash-first", name: "Bash", input: { command: "first" } }] }, sessionId: sid },
+      { parentUuid: "a-first", type: "user", uuid: "r-first", sourceToolAssistantUUID: "a-first", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "bash-first", content: "first" }] }, toolUseResult: { stdout: "first", stderr: "" }, sessionId: sid },
+      { parentUuid: "r-first", type: "assistant", uuid: "a-middle", message: { role: "assistant", content: [{ type: "tool_use", id: "shared-id", name: "Bash", input: { command: "middle" } }] }, sessionId: sid },
+      { parentUuid: "a-middle", type: "user", uuid: "r-middle", sourceToolAssistantUUID: "a-middle", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "shared-id", content: "middle" }] }, toolUseResult: { stdout: "middle", stderr: "" }, sessionId: sid },
+      { parentUuid: "r-middle", type: "assistant", uuid: "a-read", message: { role: "assistant", content: [{ type: "tool_use", id: "shared-id", name: "Read", input: { file_path: "/repo/file.ts" } }] }, sessionId: sid },
+      { parentUuid: "a-read", type: "assistant", uuid: "a-last", message: { role: "assistant", content: [{ type: "tool_use", id: "bash-last", name: "Bash", input: { command: "last" } }] }, sessionId: sid },
+      { parentUuid: "a-last", type: "user", uuid: "r-last", sourceToolAssistantUUID: "a-last", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "bash-last", content: "last" }] }, toolUseResult: { stdout: "last", stderr: "" }, sessionId: sid },
+    ];
+    writeFileSync(F, fixtureRows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+
+    // Act
+    const res = await cleanTranscript(F, { hooks: parseHooksFlag(undefined), mode: "fork" });
+    assert(res.ok === true, "클리닝 성공");
+    if (!res.outputPath) return;
+    artifacts.push(res.outputPath);
+    const after = rows(res.outputPath);
+    const bashCalls = after.flatMap((r) => Array.isArray(r.o?.message?.content) ? r.o.message.content.filter((b: any) => b?.type === "tool_use" && b?.name === "Bash") : []);
+
+    // Assert
+    assert(after.length === fixtureRows.length, "행 삭제 없음");
+    assert(bashCalls.length === 3 && bashCalls.every((b: any) => b.input?.command === "[context-cleaner: Bash]"), "Bash 세 호출을 모두 대체 처리");
+    assert(after.some((r) => r.o?.uuid === "a-read" && r.o?.message?.content?.[0]?.name === "Read"), "중복 ID인 다른 도구 호출은 보존");
+    assert(res.stats?.bashFallbackReasons?.get?.("duplicate-id") === 1, "다른 도구까지 포함한 전역 ID 중복을 기록");
+    assert(res.verify?.ok === true, `입력 기준선보다 중복 관계가 증가하지 않아 통과 (${JSON.stringify(res.verify?.problems)})`);
+  });
+
   // ── 정리 (§8: 회귀 분석을 위해 보존이 기본) ──
   if (process.env.CLEAN_ARTIFACTS === "1") {
     for (const a of artifacts) if (existsSync(a)) unlinkSync(a);
