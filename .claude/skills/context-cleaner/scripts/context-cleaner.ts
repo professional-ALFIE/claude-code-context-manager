@@ -156,6 +156,7 @@
 import { readFileSync, writeFileSync, existsSync, readdirSync, renameSync, unlinkSync } from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 
 // ============================================================================
@@ -198,9 +199,35 @@ const USER_MARKED_PATTERN = /<clean>[\s\S]*?<\/clean>/g;
 const TEAMMATE_MESSAGE_PATTERN = /(<teammate-message[^>]*>)[\s\S]*?(<\/teammate-message>)/g;
 const LOCAL_COMMAND_STDOUT_PATTERN = /(<local-command-stdout>)[\s\S]*?(<\/local-command-stdout>)/g;
 const TASK_RESULT_PATTERN = /(<result>)[\s\S]*?(<\/result>)/g;
+const TASK_NOTIFICATION_TOOL_USE_ID_PATTERN = /<tool-use-id>([^<]+)<\/tool-use-id>/g;
+const TASK_NOTIFICATION_TASK_ID_PATTERN = /<task-id>([^<]+)<\/task-id>/g;
 const AGENT_MESSAGE_PATTERN = /(<agent-message[^>]*>)[\s\S]*?(<\/agent-message>)/g;
 
 // ============================================================================
+// Claude transcript의 일반 도구 호출 관계 (실물 transcript 대조로 확인)
+//
+// 1. 요청은 assistant 행의 message.content[] 안에 있는 tool_use 블록이다.
+//    - tool_use.id: 호출 ID
+//    - tool_use.name: Bash, Read, Edit, MCP 등의 도구명
+//    - tool_use.input: 도구에 전달한 입력
+//
+// 2. 모델에게 전달되는 결과는 user 행의 message.content[] 안에 있는 tool_result 블록이다.
+//    - tool_result.tool_use_id === 대응하는 tool_use.id
+//    - tool_result.content: 문자열 또는 content block 배열 형태의 결과 표현
+//
+// 3. 같은 user 결과 행의 최상위 toolUseResult는 도구별 구조화 결과다.
+//    tool_result.content와 관련되지만 동일한 복사본이라고 가정하면 안 된다.
+//    큰 Bash 출력은 persisted-output 안내문과 실제 stdout이 갈릴 수 있고,
+//    MCP 결과에는 추가 _meta가 붙을 수 있으며, 도구에 따라 object/array/string 모두 가능하다.
+//
+// 4. 결과 행의 parentUuid와 sourceToolAssistantUUID는 대응하는 assistant tool_use 행의
+//    uuid를 가리킨다. 다만 호출과 결과의 최종 연결 기준은 아래 ID 일치다.
+//    tool_use.id === tool_result.tool_use_id
+//
+// 5. 다른 호출·결과·메타데이터 행이 사이에 들어갈 수 있으므로 행 인접성으로 연결하지 않는다.
+//    message.content[]에는 text와 tool_use 같은 다른 블록이 섞일 수 있으므로 특정 도구만
+//    제거할 때는 배열 전체를 순회해 대상 블록만 제거하고, 배열이 비었을 때만 행을 삭제한다.
+//
 // zod 상위 계약 — "우리가 읽고 분기하는 필드"의 의미 고정
 // 심층 구조(message/attachment/data/toolUseResult)는 형태 다양성이 커서 스키마로 고정하면
 // 미래 형식에서 클리닝이 통째로 스킵되는 역효과가 있다 → v4와 동일한 방어적 접근 유지.
@@ -221,6 +248,51 @@ const RowCoreSchema = z
   })
   .catchall(z.unknown());
 export type RowCore = z.infer<typeof RowCoreSchema>; // 후속 도구(TS 스위처)가 같은 계약을 import해 쓴다
+
+const ToolUseBlockSchema = z
+  .object({
+    type: z.literal("tool_use"),
+    id: z.string().optional(),
+    name: z.string(),
+    input: z.unknown().optional(),
+  })
+  .catchall(z.unknown());
+const ToolResultBlockSchema = z
+  .object({
+    type: z.literal("tool_result"),
+    tool_use_id: z.string().optional(),
+    content: z.unknown().optional(),
+  })
+  .catchall(z.unknown());
+const MessageContentBlockSchema = z.union([
+  ToolUseBlockSchema,
+  ToolResultBlockSchema,
+  z.object({ type: z.string().optional() }).catchall(z.unknown()),
+]);
+const TaskNotificationLinkSchema = z.object({
+  toolUseIds: z.array(z.string()),
+  taskIds: z.array(z.string()),
+});
+const BashFallbackReasonSchema = z.enum([
+  "missing-id",
+  "duplicate-id",
+  "missing-result",
+  "duplicate-result",
+  "owner-unknown",
+  "notification-ambiguous",
+]);
+const BashGroupDecisionSchema = z.object({
+  startRow: z.number().int().nonnegative(),
+  endRow: z.number().int().nonnegative(),
+  mode: z.enum(["preserve-inputs", "remove-middle", "replace-all-bash"]),
+  reason: BashFallbackReasonSchema.optional(),
+  callCount: z.number().int().nonnegative(),
+});
+type ToolUseBlock = z.infer<typeof ToolUseBlockSchema>;
+type ToolResultBlock = z.infer<typeof ToolResultBlockSchema>;
+type TaskNotificationLink = z.infer<typeof TaskNotificationLinkSchema>;
+type BashFallbackReason = z.infer<typeof BashFallbackReasonSchema>;
+type BashGroupDecision = z.infer<typeof BashGroupDecisionSchema>;
 
 /** --hooks 플래그 3모드 (라운드2 확정 문법: delete | keep | 이벤트,이벤트 → 적은 것만 살림) */
 export type HooksMode =
@@ -293,6 +365,14 @@ class CleaningStats {
   sourceToolRemapped = 0; sourceToolDropped = 0;
   preexistingDanglingRooted = 0; // 원본부터 끊겨 있던 parentUuid → 키 제거(root화, v4 2.5단계 계승)
   contractMissRows = 0; // RowCore 계약 위반으로 건드리지 않고 통과시킨 행
+  // ── Bash 사용자 프롬프트 묶음 정리 ──
+  bashMiddleToolUseRemoved = 0;
+  bashMiddleToolResultRemoved = 0;
+  bashBackgroundNotificationsRemoved = 0;
+  bashRowsDeleted = 0;
+  bashFallbackGroups = 0;
+  bashFallbackReasons = new Map<string, number>();
+  bashSidechainPreserved = 0;
 
   totalReplacedBytes(): number {
     return (
@@ -354,6 +434,12 @@ class CleaningStats {
     console.log(`  Synthetic rows:      ${String(this.syntheticRowsDeleted).padStart(4)} deleted (${this.syntheticRowsBytes.toLocaleString()} bytes)`);
     console.log(`  Local-cmd rows:      ${String(this.localCmdRowsDeleted).padStart(4)} deleted`);
     console.log(`  Snapshot rows:       ${String(this.snapshotRowsDropped).padStart(4)} dropped (삭제된 메시지 참조)`);
+    console.log(`  Bash middle calls:   ${String(this.bashMiddleToolUseRemoved).padStart(4)} tool_use / ${this.bashMiddleToolResultRemoved} tool_result removed`);
+    console.log(`  Bash bg notices:     ${String(this.bashBackgroundNotificationsRemoved).padStart(4)} removed`);
+    console.log(`  Bash rows:           ${String(this.bashRowsDeleted).padStart(4)} deleted`);
+    console.log(`  Bash fallbacks:      ${String(this.bashFallbackGroups).padStart(4)} groups`);
+    for (const [k, n] of this.bashFallbackReasons) console.log(`      - ${k}: ${n}`);
+    console.log(`  Bash sidechain:      ${String(this.bashSidechainPreserved).padStart(4)} preserved`);
     console.log(`  leafUuid remapped:   ${String(this.leafUuidRemapped).padStart(4)} / dropped: ${this.leafUuidDropped}`);
     console.log(`  sourceTool remapped: ${String(this.sourceToolRemapped).padStart(4)} / dropped: ${this.sourceToolDropped}`);
     console.log(`  Dangling rooted:     ${String(this.preexistingDanglingRooted).padStart(4)} (원본부터 끊겨 있던 parentUuid)`);
@@ -410,6 +496,7 @@ export function sessionIdFromPath(p: string): string {
 // 각 함수는 독립적이며 실패해도(예외) 다른 클리너에 영향을 주지 않는다.
 // ============================================================================
 type Row = Record<string, any>;
+type ParsedRow = { raw: string; o: Row | null };
 
 /** thinking "블록" 치환 — 삭제되지 않은(=혼합) 행에만 잔여 적용. signature는 절대 불변.
  *  v4는 content[0]만 봤지만 v5는 모든 thinking 블록을 본다(상위집합, 안전). */
@@ -625,17 +712,21 @@ function cleanEditResult(o: Row, stats: CleaningStats): boolean {
 
 function cleanBashInput(o: Row, stats: CleaningStats): boolean {
   try {
-    const first = o?.message?.content?.[0];
-    if (first?.name === "Bash" && first?.type === "tool_use") {
-      const inp = first.input;
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) return false;
+    let cleaned = false;
+    for (const block of content) {
+      const parsed = ToolUseBlockSchema.safeParse(block);
+      if (!parsed.success || parsed.data.name !== "Bash") continue;
+      const inp = block.input;
       if (inp && typeof inp === "object" && "command" in inp && inp.command && inp.command !== CLEANED_BASH_INPUT) {
         stats.bashInputCount++;
         stats.bashInputBytes += byteLen(inp.command);
         inp.command = CLEANED_BASH_INPUT;
-        return true;
+        cleaned = true;
       }
     }
-    return false;
+    return cleaned;
   } catch { return false; }
 }
 
@@ -687,31 +778,37 @@ function cleanExitPlanModeInput(o: Row, stats: CleaningStats): boolean {
   } catch { return false; }
 }
 
+function cleanToolResultBlockContent(block: Row, stats: CleaningStats): boolean {
+  const original = block.content;
+  if (typeof original === "string") {
+    if (!original || original === CLEANED_TOOL_RESULT) return false;
+    stats.toolResultBytes += byteLen(original);
+    block.content = CLEANED_TOOL_RESULT;
+    return true;
+  }
+  if (!Array.isArray(original)) return false;
+  let cleaned = false;
+  for (const item of original) {
+    if (item && typeof item === "object" && "text" in item && item.text && item.text !== CLEANED_TOOL_RESULT) {
+      stats.toolResultBytes += byteLen(item.text);
+      item.text = CLEANED_TOOL_RESULT;
+      cleaned = true;
+    }
+  }
+  return cleaned;
+}
+
 function cleanToolResultContent(o: Row, stats: CleaningStats): boolean {
   try {
-    const first = o?.message?.content?.[0];
-    if (first && typeof first === "object" && first.type === "tool_result" && "content" in first) {
-      const original = first.content;
-      if (typeof original === "string") {
-        if (original && original !== CLEANED_TOOL_RESULT) {
-          stats.toolResultCount++;
-          stats.toolResultBytes += byteLen(original);
-          first.content = CLEANED_TOOL_RESULT;
-          return true;
-        }
-      } else if (Array.isArray(original)) {
-        let cleaned = false;
-        for (const item of original) {
-          if (item && typeof item === "object" && "text" in item && item.text && item.text !== CLEANED_TOOL_RESULT) {
-            stats.toolResultBytes += byteLen(item.text);
-            item.text = CLEANED_TOOL_RESULT;
-            cleaned = true;
-          }
-        }
-        if (cleaned) { stats.toolResultCount++; return true; }
-      }
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) return false;
+    let count = 0;
+    for (const block of content) {
+      if (!ToolResultBlockSchema.safeParse(block).success || !("content" in block)) continue;
+      if (cleanToolResultBlockContent(block, stats)) count++;
     }
-    return false;
+    stats.toolResultCount += count;
+    return count > 0;
   } catch { return false; }
 }
 
@@ -1302,6 +1399,255 @@ function isSyntheticRow(o: Row): boolean {
   return false;
 }
 
+const AUTOMATED_ORIGIN_KINDS = new Set(["task-notification", "agent-message", "teammate-message"]);
+
+type BashCallRef = {
+  id?: string;
+  rowIndex: number;
+  blockIndex: number;
+  assistantUuid?: string;
+  groupIndex: number;
+};
+type ToolResultRef = { rowIndex: number; blockIndex: number };
+type NotificationRef = { rowIndex: number; link: TaskNotificationLink };
+type BashCleaningPlan = {
+  decisions: BashGroupDecision[];
+  removeIds: Set<string>;
+  removeAssistantBlocks: Map<number, Set<number>>;
+  removeResultBlocks: Map<number, Set<number>>;
+  removeNotificationRows: Set<number>;
+  fallbackRows: Set<number>;
+  fallbackReasons: Map<number, BashFallbackReason>;
+  bashToolNames: Map<string, string>;
+  originalPreservedInputs: Map<string, unknown>;
+};
+
+function isActualUserPrompt(o: Row): boolean {
+  if (o?.type !== "user" || o?.isMeta === true || o?.isSidechain === true || o?.promptSource === "system") return false;
+  if (AUTOMATED_ORIGIN_KINDS.has(String(o?.origin?.kind ?? ""))) return false;
+  if (isSyntheticRow(o)) return false;
+  const content = o?.message?.content;
+  if (Array.isArray(content) && content.some((block: unknown) => ToolResultBlockSchema.safeParse(block).success)) return false;
+  if (typeof content === "string" && (content.includes("<local-command-caveat>") || content.includes("<bash-input>"))) return false;
+  return true;
+}
+
+function parseTaskNotificationLink(o: Row): TaskNotificationLink | null {
+  if (o?.type !== "user" || o?.origin?.kind !== "task-notification") return null;
+  const content = o?.message?.content;
+  if (typeof content !== "string" || !content.includes("<task-notification>")) return null;
+  const toolUseIds = [...content.matchAll(TASK_NOTIFICATION_TOOL_USE_ID_PATTERN)].map((match) => match[1].trim()).filter(Boolean);
+  const taskIds = [...content.matchAll(TASK_NOTIFICATION_TASK_ID_PATTERN)].map((match) => match[1].trim()).filter(Boolean);
+  const parsed = TaskNotificationLinkSchema.safeParse({ toolUseIds, taskIds });
+  return parsed.success ? parsed.data : null;
+}
+
+function buildBashCleaningPlan(rows: ParsedRow[], stats: CleaningStats): BashCleaningPlan {
+  const calls: BashCallRef[] = [];
+  const toolUseCounts = new Map<string, number>();
+  const resultsById = new Map<string, ToolResultRef[]>();
+  const notifications: NotificationRef[] = [];
+  const groupStarts: number[] = [];
+  let activeGroup = -1;
+
+  for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+    const o = rows[rowIndex].o;
+    if (!o) continue;
+    if (isActualUserPrompt(o)) {
+      activeGroup++;
+      groupStarts.push(rowIndex);
+    }
+    const notification = parseTaskNotificationLink(o);
+    if (notification) notifications.push({ rowIndex, link: notification });
+
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
+      const block = content[blockIndex];
+      if (!MessageContentBlockSchema.safeParse(block).success) continue;
+      const toolUse = ToolUseBlockSchema.safeParse(block);
+      if (toolUse.success) {
+        if (toolUse.data.id) toolUseCounts.set(toolUse.data.id, (toolUseCounts.get(toolUse.data.id) ?? 0) + 1);
+        if (toolUse.data.name === "Bash" && o.isSidechain !== true && activeGroup >= 0) {
+          calls.push({
+            id: toolUse.data.id,
+            rowIndex,
+            blockIndex,
+            assistantUuid: typeof o.uuid === "string" ? o.uuid : undefined,
+            groupIndex: activeGroup,
+          });
+        }
+        if (toolUse.data.name === "Bash" && o.isSidechain === true) stats.bashSidechainPreserved++;
+      }
+      const toolResult = ToolResultBlockSchema.safeParse(block);
+      if (toolResult.success && toolResult.data.tool_use_id) {
+        const refs = resultsById.get(toolResult.data.tool_use_id) ?? [];
+        refs.push({ rowIndex, blockIndex });
+        resultsById.set(toolResult.data.tool_use_id, refs);
+      }
+    }
+  }
+
+  const toolNames = new Map<string, string>();
+  for (const { o } of rows) {
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      const parsed = ToolUseBlockSchema.safeParse(block);
+      if (parsed.success && parsed.data.id) toolNames.set(parsed.data.id, parsed.data.name);
+    }
+  }
+
+  const callsByGroup = new Map<number, BashCallRef[]>();
+  for (const call of calls) {
+    const group = callsByGroup.get(call.groupIndex) ?? [];
+    group.push(call);
+    callsByGroup.set(call.groupIndex, group);
+  }
+
+  const removeIds = new Set<string>();
+  const removeAssistantBlocks = new Map<number, Set<number>>();
+  const removeResultBlocks = new Map<number, Set<number>>();
+  const removeNotificationRows = new Set<number>();
+  const fallbackRows = new Set<number>();
+  const fallbackReasons = new Map<number, BashFallbackReason>();
+  const decisions: BashGroupDecision[] = [];
+  const originalPreservedInputs = new Map<string, unknown>();
+
+  for (let groupIndex = 0; groupIndex < groupStarts.length; groupIndex++) {
+    const groupCalls = callsByGroup.get(groupIndex) ?? [];
+    const startRow = groupStarts[groupIndex];
+    const endRow = (groupStarts[groupIndex + 1] ?? rows.length) - 1;
+    if (groupCalls.length <= 2) {
+      decisions.push(BashGroupDecisionSchema.parse({ startRow, endRow, mode: "preserve-inputs", callCount: groupCalls.length }));
+      for (const call of groupCalls) if (call.id) originalPreservedInputs.set(call.id, structuredClone(rows[call.rowIndex].o?.message?.content?.[call.blockIndex]?.input));
+      continue;
+    }
+
+    let reason: BashFallbackReason | undefined;
+    const groupIds = groupCalls.map((call) => call.id).filter((id): id is string => typeof id === "string");
+    if (groupIds.length !== groupCalls.length) reason = "missing-id";
+    if (!reason && new Set(groupIds).size !== groupIds.length) reason = "duplicate-id";
+
+    const middleCalls = groupCalls.slice(1, -1);
+    if (!reason) {
+      for (const call of middleCalls) {
+        const id = call.id!;
+        if ((toolUseCounts.get(id) ?? 0) !== 1) { reason = "duplicate-id"; break; }
+        const results = resultsById.get(id) ?? [];
+        if (results.length === 0) { reason = "missing-result"; break; }
+        if (results.length > 1) { reason = "duplicate-result"; break; }
+        const resultRow = rows[results[0].rowIndex].o;
+        const resultBlocks = Array.isArray(resultRow?.message?.content)
+          ? resultRow.message.content.filter((block: unknown) => ToolResultBlockSchema.safeParse(block).success)
+          : [];
+        if (resultBlocks.length > 1 || (typeof resultRow?.sourceToolAssistantUUID === "string" && resultRow.sourceToolAssistantUUID !== call.assistantUuid)) {
+          reason = "owner-unknown";
+          break;
+        }
+        const tur = resultRow?.toolUseResult;
+        const backgroundTaskId = tur && typeof tur === "object" && typeof tur.backgroundTaskId === "string" ? tur.backgroundTaskId : null;
+        if (backgroundTaskId) {
+          const matching = notifications.filter(({ link }) => link.toolUseIds.includes(id));
+          const taskOnly = notifications.filter(({ link }) => link.toolUseIds.length === 0 && link.taskIds.includes(backgroundTaskId));
+          if (matching.length !== 1 || taskOnly.length > 0) { reason = "notification-ambiguous"; break; }
+        }
+      }
+    }
+
+    if (reason) {
+      decisions.push(BashGroupDecisionSchema.parse({ startRow, endRow, mode: "replace-all-bash", reason, callCount: groupCalls.length }));
+      stats.bashFallbackGroups++;
+      stats.bashFallbackReasons.set(reason, (stats.bashFallbackReasons.get(reason) ?? 0) + 1);
+      fallbackReasons.set(groupIndex, reason);
+      for (let rowIndex = startRow; rowIndex <= endRow; rowIndex++) fallbackRows.add(rowIndex);
+      continue;
+    }
+
+    decisions.push(BashGroupDecisionSchema.parse({ startRow, endRow, mode: "remove-middle", callCount: groupCalls.length }));
+    for (const call of [groupCalls[0], groupCalls[groupCalls.length - 1]])
+      if (call.id) originalPreservedInputs.set(call.id, structuredClone(rows[call.rowIndex].o?.message?.content?.[call.blockIndex]?.input));
+    for (const call of middleCalls) {
+      const id = call.id!;
+      removeIds.add(id);
+      const assistantBlocks = removeAssistantBlocks.get(call.rowIndex) ?? new Set<number>();
+      assistantBlocks.add(call.blockIndex);
+      removeAssistantBlocks.set(call.rowIndex, assistantBlocks);
+      const result = resultsById.get(id)![0];
+      const resultBlocks = removeResultBlocks.get(result.rowIndex) ?? new Set<number>();
+      resultBlocks.add(result.blockIndex);
+      removeResultBlocks.set(result.rowIndex, resultBlocks);
+      const resultRow = rows[result.rowIndex].o;
+      const backgroundTaskId = resultRow?.toolUseResult && typeof resultRow.toolUseResult === "object" && typeof resultRow.toolUseResult.backgroundTaskId === "string"
+        ? resultRow.toolUseResult.backgroundTaskId
+        : null;
+      if (backgroundTaskId) {
+        const notification = notifications.find(({ link }) => link.toolUseIds.includes(id));
+        if (notification) removeNotificationRows.add(notification.rowIndex);
+      }
+    }
+  }
+
+  return {
+    decisions,
+    removeIds,
+    removeAssistantBlocks,
+    removeResultBlocks,
+    removeNotificationRows,
+    fallbackRows,
+    fallbackReasons,
+    bashToolNames: toolNames,
+    originalPreservedInputs,
+  };
+}
+
+function applyBashCleaningPlan(rows: ParsedRow[], plan: BashCleaningPlan, deleteReason: Map<number, string>, stats: CleaningStats): void {
+  for (const rowIndex of plan.fallbackRows) {
+    const o = rows[rowIndex].o;
+    if (!o) continue;
+    cleanBashInput(o, stats);
+    const content = o?.message?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        const parsed = ToolResultBlockSchema.safeParse(block);
+        if (!parsed.success || !parsed.data.tool_use_id || plan.bashToolNames.get(parsed.data.tool_use_id) !== "Bash") continue;
+        if (cleanToolResultBlockContent(block, stats)) stats.toolResultCount++;
+      }
+    }
+    const resultBlocks = Array.isArray(content)
+      ? content.filter((block: unknown) => ToolResultBlockSchema.safeParse(block).success) as ToolResultBlock[]
+      : [];
+    if (resultBlocks.length === 1 && resultBlocks[0].tool_use_id && plan.bashToolNames.get(resultBlocks[0].tool_use_id) === "Bash") cleanBashResult(o, stats);
+  }
+
+  for (const [rowIndex, blockIndexes] of plan.removeAssistantBlocks) {
+    const o = rows[rowIndex].o;
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) continue;
+    o.message.content = content.filter((_: unknown, blockIndex: number) => !blockIndexes.has(blockIndex));
+    stats.bashMiddleToolUseRemoved += blockIndexes.size;
+    if (o.message.content.length === 0) deleteReason.set(rowIndex, "bash-middle");
+  }
+
+  for (const [rowIndex, blockIndexes] of plan.removeResultBlocks) {
+    const o = rows[rowIndex].o;
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) continue;
+    const removedAssistantUuid = typeof o.sourceToolAssistantUUID === "string" ? o.sourceToolAssistantUUID : null;
+    o.message.content = content.filter((_: unknown, blockIndex: number) => !blockIndexes.has(blockIndex));
+    stats.bashMiddleToolResultRemoved += blockIndexes.size;
+    delete o.toolUseResult;
+    if (!o.message.content.some((block: unknown) => ToolResultBlockSchema.safeParse(block).success)) delete o.sourceToolAssistantUUID;
+    if (o.message.content.length === 0) deleteReason.set(rowIndex, "bash-middle");
+    void removedAssistantUuid;
+  }
+
+  for (const rowIndex of plan.removeNotificationRows) {
+    deleteReason.set(rowIndex, "bash-notification");
+    stats.bashBackgroundNotificationsRemoved++;
+  }
+}
+
 /* [지식: queue-operation 행 — 조사했으나 "삭제하지 않는다"로 결정됨 (2026-07-31)]
  *   비동기 알림이나 사용자 입력이 응답 생성 중에 도착해 큐에 쌓였다(enqueue) 꺼내진
  *   (dequeue/remove) 타이밍 기록. Workflow·Monitor·백그라운드 Bash를 쓰면 생긴다.
@@ -1333,6 +1679,9 @@ export type Analysis = {
   unresolvedLeafUuid: number;     // last-prompt.leafUuid 미해소
   unresolvedSnapshotMessageId: number;
   unresolvedSourceTool: number;
+  orphanToolResults: number;
+  duplicateToolUseIds: number;
+  duplicateToolResultIds: number;
   cycles: number;                 // parentUuid 사슬 순환 (오염 파일 감지)
   tipCount: number;               // user/assistant leaf 수 (평행세계 갈래 수 가늠)
   chainLengthFromNewestTip: number; // 최신 tip에서 root까지 길이 (fix-session 진단 차용)
@@ -1356,6 +1705,8 @@ export function analyzeLines(lines: string[]): Analysis {
   const uuids = new Set(objs.filter((o) => typeof o.uuid === "string").map((o) => o.uuid as string));
   const byUuid = new Map(objs.filter((o) => typeof o.uuid === "string").map((o) => [o.uuid as string, o]));
   let orphanParents = 0, unresolvedLeafUuid = 0, unresolvedSnapshotMessageId = 0, unresolvedSourceTool = 0;
+  const toolUseCounts = new Map<string, number>();
+  const toolResultCounts = new Map<string, number>();
   const parents = new Set<string>();
   for (const o of objs) {
     if (typeof o.parentUuid === "string") {
@@ -1365,7 +1716,19 @@ export function analyzeLines(lines: string[]): Analysis {
     if (o.type === "last-prompt" && typeof o.leafUuid === "string" && !uuids.has(o.leafUuid)) unresolvedLeafUuid++;
     if (o.type === "file-history-snapshot" && typeof o.messageId === "string" && !uuids.has(o.messageId)) unresolvedSnapshotMessageId++;
     if (typeof o.sourceToolAssistantUUID === "string" && !uuids.has(o.sourceToolAssistantUUID)) unresolvedSourceTool++;
+    const content = o?.message?.content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      const toolUse = ToolUseBlockSchema.safeParse(block);
+      if (toolUse.success && toolUse.data.id) toolUseCounts.set(toolUse.data.id, (toolUseCounts.get(toolUse.data.id) ?? 0) + 1);
+      const toolResult = ToolResultBlockSchema.safeParse(block);
+      if (toolResult.success && toolResult.data.tool_use_id) toolResultCounts.set(toolResult.data.tool_use_id, (toolResultCounts.get(toolResult.data.tool_use_id) ?? 0) + 1);
+    }
   }
+  let orphanToolResults = 0;
+  for (const [id, count] of toolResultCounts) if (!toolUseCounts.has(id)) orphanToolResults += count;
+  const duplicateToolUseIds = [...toolUseCounts.values()].filter((count) => count > 1).length;
+  const duplicateToolResultIds = [...toolResultCounts.values()].filter((count) => count > 1).length;
   // 사이클 검출 (white/gray/black 3색 — fix-session의 seen 가드 확장)
   const state = new Map<string, 0 | 1 | 2>();
   let cycles = 0;
@@ -1447,7 +1810,8 @@ export function analyzeLines(lines: string[]): Analysis {
 
   return {
     parseErrors, totalRows: objs.length, orphanParents, unresolvedLeafUuid,
-    unresolvedSnapshotMessageId, unresolvedSourceTool, cycles,
+    unresolvedSnapshotMessageId, unresolvedSourceTool,
+    orphanToolResults, duplicateToolUseIds, duplicateToolResultIds, cycles,
     tipCount: tips.length, chainLengthFromNewestTip,
     reachedRootFromNewestTip, conversationRootCount, nonBoundaryRootCount, conversationRootUuids,
     anchorLeafUuid, anchorResolvable, reachedRootFromAnchor,
@@ -1471,6 +1835,9 @@ export function verifyAgainstBaseline(inputLines: string[], outputLines: string[
   if (output.unresolvedLeafUuid > input.unresolvedLeafUuid) problems.push(`last-prompt.leafUuid 미해소 증가 (${input.unresolvedLeafUuid}→${output.unresolvedLeafUuid})`);
   if (output.unresolvedSnapshotMessageId > input.unresolvedSnapshotMessageId) problems.push(`snapshot.messageId 미해소 증가 (${input.unresolvedSnapshotMessageId}→${output.unresolvedSnapshotMessageId})`);
   if (output.unresolvedSourceTool > input.unresolvedSourceTool) problems.push(`sourceToolAssistantUUID 미해소 증가 (${input.unresolvedSourceTool}→${output.unresolvedSourceTool})`);
+  if (output.orphanToolResults > input.orphanToolResults) problems.push(`고아 tool_result 증가 (${input.orphanToolResults}→${output.orphanToolResults})`);
+  if (output.duplicateToolUseIds > input.duplicateToolUseIds) problems.push(`중복 tool_use.id 증가 (${input.duplicateToolUseIds}→${output.duplicateToolUseIds})`);
+  if (output.duplicateToolResultIds > input.duplicateToolResultIds) problems.push(`중복 tool_result.tool_use_id 증가 (${input.duplicateToolResultIds}→${output.duplicateToolResultIds})`);
   if (output.parseErrors > input.parseErrors) problems.push(`깨진 JSON 줄 증가 (${input.parseErrors}→${output.parseErrors})`);
   // ── [PLAN §5] uuid 체인 판정 3종 (절대 기준 — 출력만 본다) ──
   // §5.1 최신 tip walk가 root에 미도달 → 체인 끊김.
@@ -1697,6 +2064,10 @@ export async function cleanTranscript(
   }
   const keepHookContent = hooks.mode !== "delete"; // 살아남는 훅은 내용도 원문 보존
 
+  // 1.5) 사용자 프롬프트별 Bash 묶음 계획 — 어떤 값도 바꾸기 전에 ID 관계를 확정한다.
+  const bashPlan = buildBashCleaningPlan(rows, stats);
+  applyBashCleaningPlan(rows, bashPlan, deleteReason, stats);
+
   // 2) 값 치환 (삭제될 행은 건너뜀 — 어차피 사라질 바이트)
   for (let i = 0; i < rows.length; i++) {
     const o = rows[i].o;
@@ -1754,7 +2125,8 @@ export async function cleanTranscript(
         stats.hookRowsDeleted++; stats.hookRowsBytes += bytes;
         const k = reason.slice(5);
         stats.hookRowsByKey.set(k, (stats.hookRowsByKey.get(k) ?? 0) + 1);
-      } else stats.localCmdRowsDeleted++;
+      } else if (reason === "bash-middle" || reason === "bash-notification") stats.bashRowsDeleted++;
+      else stats.localCmdRowsDeleted++;
       continue;
     }
     kept.push(r);
@@ -1819,6 +2191,36 @@ export async function cleanTranscript(
 
   // 8) 재검증 (analyze → fix → re-analyze 패턴) — 쓰기 "전"에 검증한다 (PLAN D5: rename 전 검증)
   const verify = verifyAgainstBaseline(inputLines, outputLines);
+  const outputObjects: Row[] = [];
+  for (const line of outputLines) {
+    try { outputObjects.push(JSON.parse(line)); } catch { /* 깨진 입력 줄은 기존 기준선 검사가 판정 */ }
+  }
+  const outputToolUses = new Map<string, ToolUseBlock>();
+  const outputToolResults = new Set<string>();
+  const outputNotificationIds = new Set<string>();
+  for (const o of outputObjects) {
+    const content = o?.message?.content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        const toolUse = ToolUseBlockSchema.safeParse(block);
+        if (toolUse.success && toolUse.data.id) outputToolUses.set(toolUse.data.id, toolUse.data);
+        const toolResult = ToolResultBlockSchema.safeParse(block);
+        if (toolResult.success && toolResult.data.tool_use_id) outputToolResults.add(toolResult.data.tool_use_id);
+      }
+    }
+    const link = parseTaskNotificationLink(o);
+    if (link) for (const id of link.toolUseIds) outputNotificationIds.add(id);
+  }
+  for (const id of bashPlan.removeIds) {
+    if (outputToolUses.has(id) || outputToolResults.has(id) || outputNotificationIds.has(id))
+      verify.problems.push(`제거 대상 Bash ID 잔존: ${id}`);
+  }
+  for (const [id, input] of bashPlan.originalPreservedInputs) {
+    const output = outputToolUses.get(id);
+    if (!output) verify.problems.push(`보존 대상 Bash tool_use 소실: ${id}`);
+    else if (!isDeepStrictEqual(output.input, input)) verify.problems.push(`보존 대상 Bash input 변경: ${id}`);
+  }
+  verify.ok = verify.problems.length === 0;
   const resumeCommand = buildResumeCommand(normalizeHomePrefix(lastCwd(rows)), newSessionId);
 
   // 9) [PLAN D5] 쓰기

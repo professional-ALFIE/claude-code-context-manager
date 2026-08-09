@@ -52,7 +52,7 @@ After all steps, tell me to restart the session.
 - hook progress·hook summary·hook attachment, synthetic/local-command 행, tool result 중복 데이터, meta content
 
 보존 항목: 대화 텍스트, 편집 의도, UUID 체인, resume anchor, 갈래 tip,
-**bash command 전문**, **파일 전체 경로**
+**Bash 묶음의 재현 가치가 있는 첫·마지막 command 전문**, **파일 전체 경로**
 
 > **2026-07 변경 — 명령어와 경로를 이제 보존합니다.**
 > 이전에는 `input.command`를 치환하고 전체 경로를 파일명으로 잘랐습니다.
@@ -62,7 +62,7 @@ After all steps, tell me to restart the session.
 > 감량률은 양쪽 모두 **68.8%** 로 동일 — 남겨도 사실상 공짜입니다.
 > 파일명만 남기면 같은 이름의 다른 파일을 구분할 수 없고(예: 서로 다른 `CLAUDE.md` 두 개),
 > 명령어 안의 옵션·정규식·필드 오프셋 시행착오는 요약으로 복원되지 않습니다.
-> 두 동작 모두 **주석 한 줄**로 되돌릴 수 있습니다 — [되돌리기](#되돌리기-보존-vs-제거) 참조.
+> 파일 경로 보존과 서브에이전트 Bash command 정책은 주석으로 되돌릴 수 있습니다. 메인 대화 Bash는 아래의 사용자 프롬프트별 묶음 정책을 적용합니다 — [되돌리기](#되돌리기-보존-vs-제거) 참조.
 
 > **2026-07-31 변경 — base64 이미지와 `attachment.snippet`.**
 > 도구가 반환한 스크린샷은 같은 이미지가 **두 곳**에 저장됩니다.
@@ -131,9 +131,32 @@ thinking-only assistant 행은 삭제하고 참조를 다시 연결합니다. th
 
 #### Bash
 
-명령을 실행하면 명령어와 전체 출력이 기록됩니다.
+명령을 실행하면 명령어와 전체 출력이 기록됩니다. 실제 사용자 프롬프트부터 다음 실제 사용자 프롬프트 직전까지를 한 묶음으로 보고, main-chain Bash만 발생 순서대로 셉니다.
 
-- **호출**: `input.command` → **보존 (전문)**
+```yaml
+Bash_1개:
+  호출: input.command 전문 보존
+  결과: 기존 marker로 치환
+Bash_2개:
+  호출: 두 input.command 전문 보존
+  결과: 두 결과를 기존 marker로 치환
+Bash_3개_이상:
+  첫_호출: input.command 전문 보존
+  중간_호출: ID로 연결이 확정된 tool_use·tool_result 제거
+  마지막_호출: input.command 전문 보존
+  보존_결과: 기존 marker로 치환
+모호한_묶음:
+  행_삭제: 하지 않음
+  모든_Bash_입력과_결과: 기존 marker로 치환
+sidechain:
+  처리: 개수와 중간 제거 대상에서 제외하고 기존 동작 유지
+background:
+  중간_호출: 직접 결과와 같은 tool-use-id의 완료 알림도 함께 제거
+```
+
+- 호출과 결과는 행 위치가 아니라 `tool_use.id === tool_result.tool_use_id`로 연결합니다.
+- 혼합 `message.content[]`에서는 대상 Bash 블록만 제거하고, 블록이 모두 사라졌을 때만 행을 삭제합니다.
+- 중간 호출에 ID가 없거나 중복되거나, 결과가 없거나 중복되거나, 구조화 결과의 소유자를 확정할 수 없거나, background 완료 알림 연결이 모호하면 묶음 전체를 안전하게 대체 처리합니다.
 - **실행 결과**: `toolUseResult.stdout`, `.stderr` → 치환
 - **진행 로그**: `data.output`, `data.fullOutput` (bash_progress 행) → 치환
 - **결과 중복**: `tool_result.content` → 치환
@@ -204,16 +227,13 @@ URL을 가져오면 페이지 전체 내용이 기록됩니다.
 
 ### 되돌리기: 보존 vs 제거
 
-bash command와 전체 경로를 보존하는 것은 **기본값이지 고정 규칙이 아닙니다.**
-각 동작은 `scripts/context-cleaner.ts`의 주석 블록으로 꺼져 있으므로, 주석을 풀면 다시 제거합니다.
-다른 수정은 필요 없습니다.
+파일 전체 경로와 서브에이전트 Bash command를 보존하는 것은 **기본값이지 고정 규칙이 아닙니다.** 해당 동작은 `scripts/context-cleaner.ts`의 주석 블록으로 꺼져 있으므로 주석을 풀면 다시 제거합니다.
 
-**bash command를 제거하려면** (2곳 주석 해제):
+메인 대화 Bash command는 단일 함수 호출을 켜고 끄는 예전 방식이 아니라, 사용자 프롬프트별 묶음 정책에 포함됩니다. 정책을 바꾸려면 `buildBashCleaningPlan()`의 `preserve-inputs`·`remove-middle`·`replace-all-bash` 판정을 함께 수정하고 Integration 테스트 T27~T31로 참조 무결성과 모호한 대체 처리를 검증해야 합니다.
 
-| 위치 | 대상 |
-|---|---|
-| `processLine()` | `// cleanBashInput(o, stats);` |
-| `cleanAgentProgress()` | 주석 처리된 `input.command` 블록 (서브에이전트 bash) |
+**서브에이전트 Bash command를 제거하려면**:
+
+- `cleanAgentProgress()` 안의 주석 처리된 `input.command` 블록을 해제합니다.
 
 **파일 전체 경로를 제거하려면** (5곳 주석 해제):
 
@@ -226,9 +246,8 @@ bash command와 전체 경로를 보존하는 것은 **기본값이지 고정 �
 | `cleanEditResult()` | 주석 처리된 `filePath` 블록 |
 
 참고:
-- `cleanBashInput()`과 `cleanInputFilepath()` 함수 자체는 **소스에 남겨뒀습니다** (호출만 껐습니다).
-  되돌리기를 한 줄 수정으로 만들기 위해서입니다. 그래서 이 설정에서는 통계의 `Bash inputs`와
-  `Filenames` 값이 항상 `0`입니다 — 정상이며 버그가 아닙니다.
+- `cleanBashInput()`은 모호한 Bash 묶음을 삭제하지 않고 안전하게 대체 처리할 때 사용합니다. 따라서 `Bash inputs` 통계는 해당 묶음이 있을 때 증가합니다.
+- `cleanInputFilepath()` 함수는 소스에 남아 있지만 호출은 꺼져 있으므로 `Filenames` 통계가 `0`인 것은 정상입니다.
 - `row.cwd`는 원래부터 손대지 않습니다. resume 명령의 `cd` 대상을 만드는 근거이기 때문입니다.
 - 시스템 프롬프트는 transcript에 **기록되지 않습니다**. 제거할 대상 자체가 없습니다.
 
